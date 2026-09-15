@@ -477,7 +477,20 @@
         }
         
         rename.onclick = function(e){
-          
+          var srcPath = pathInput.value.trim();
+          if (srcPath === "" || srcPath === "/") {
+            alert("請先選擇要重新命名的檔案或資料夾");
+            return;
+          }
+          if (!srcPath.startsWith("/")) srcPath = "/" + srcPath;
+
+          var dstPath = prompt("重新命名 " + srcPath + " 為：", srcPath);
+          if (dstPath == null) return;
+          dstPath = dstPath.trim();
+          if (dstPath === "" || dstPath === srcPath) return;
+          if (!dstPath.startsWith("/")) dstPath = "/" + dstPath;
+
+          tree.httpRename(srcPath, dstPath);
         }
         
       }
@@ -949,6 +962,9 @@
           xmlHttp.open("PUT", "/edit");
           xmlHttp.send(formData);
         }
+
+        // 讓上方工具列的 rename 按鈕也能呼叫同一個重新命名 API
+        this.httpRename = httpRename;
 
         function httpDelete(path) {
           setLoading(true, "Deleting '" + path + "'...");

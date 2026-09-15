@@ -55,7 +55,6 @@ static const PlayerDef PLAYER_YOSHI = {
   31
 };
 
-
 static const PlayerDef* const players[] = {
   &PLAYER_MARIO,
   &PLAYER_LUIGI,
@@ -65,20 +64,26 @@ static const PlayerDef* const players[] = {
 static const int PLAYER_COUNT = sizeof(players) / sizeof(players[0]);
 static const PlayerDef* currentPlayerDef = &PLAYER_MARIO;
 
-
-
 static int marioVictorySet = 0;   // 0 = 345, 1 = 346
 static unsigned long marioRestAnimStartMs = 0;
-static const unsigned long MARIO_REST_VICTORY_DURATION_MS = 2700;
 
 // =====================================================
 // 模式時間
-// 跑 60 秒 -> 休息 5分鐘
 // =====================================================
-static const unsigned long RUN_DURATION_MS  = 60000UL;
-static const unsigned long REST_DURATION_MS = 60000*5UL;
+static const unsigned long RUN_DURATION_MS              = 60000UL;        // 正常跑動 60 秒
+static const unsigned long REST_DURATION_MS             = 60000UL * 5UL;  // 休息 5 分鐘
+static const unsigned long MARIO_VICTORY_DURATION_MS    = 2700UL;         // 勝利動畫時間
+static const unsigned long VICTORY_AFTER_WAIT_MS        = 2000UL;         // 勝利結束後等待 2 秒
+static const unsigned long CHARACTER_SWAP_WAIT_MS       = 1000UL;         // 舊角色跑出後等待 1 秒
 
-
+// =====================================================
+// 角色進出場參數
+// =====================================================
+// HERO_ENTER_STEP_PX：角色從左側跑進來的速度
+// HERO_EXIT_STEP_PX ：角色往右側跑出螢幕的速度
+// 64x64 螢幕建議 2，想慢一點改 1，想快一點改 3。
+static const int HERO_ENTER_STEP_PX = 1;
+static const int HERO_EXIT_STEP_PX  = 1;
 
 // =====================================================
 // 怪物資料
@@ -165,7 +170,6 @@ static const MonsterDef MONSTER_8 = {
   2
 };
 
-
 // 怪物清單
 static const MonsterDef* const monsters[] = {
   &MONSTER_1,
@@ -178,7 +182,6 @@ static const MonsterDef* const monsters[] = {
   &MONSTER_8
 };
 
-
 static const int MONSTER_COUNT = sizeof(monsters) / sizeof(monsters[0]);
 static const MonsterDef* currentMonster = nullptr;
 
@@ -190,8 +193,7 @@ static const int SCENERY_TYPE_GROUND = 0;   // 山、草叢
 static const int SCENERY_TYPE_CLOUD  = 1;   // 雲
 
 static unsigned long sceneryLastMoveMs = 0;
-static unsigned long sceneryMoveIntervalMs = 180;  //背景物件 移動速度 越大越慢
-
+static unsigned long sceneryMoveIntervalMs = 120;  // 背景物件移動速度，越大越慢
 
 struct SceneryDef {
   const uint8_t* sprite;
@@ -273,7 +275,6 @@ static const SceneryDef SCENERY_WAY = {
   SCENERY_TYPE_GROUND
 };
 
-
 static const SceneryDef SCENERY_GROUND_TILE = {
   GROUND,
   GROUND_PALETTE,
@@ -285,7 +286,6 @@ static const SceneryDef SCENERY_GROUND_TILE = {
 };
 
 static int groundX = 0;
-
 
 static const SceneryDef* const sceneryDefs[] = {
   &SCENERY_HILL,
@@ -311,12 +311,29 @@ static SceneryInstance sceneryPool[MAX_SCENERY_INSTANCES];
 // =====================================================
 // 大模式狀態
 // =====================================================
+// 新流程：
+// ENTERING_RUN  ：一開始角色從左側跑進來
+// RUNNING       ：正常跑動，怪物出現，踩怪
+// VICTORY       ：跑滿時間後播放勝利動畫
+// VICTORY_WAIT  ：勝利動畫結束後等待 2 秒
+// EXITING       ：舊角色往右跑出螢幕
+// SWAP_WAIT     ：舊角色離開後等待 1 秒
+// ENTERING_REST ：下一位隨機角色從左側跑進來
+// REST          ：新角色站著等待，休息 5 分鐘
+// 休息結束後，這位新角色直接進入 RUNNING
+// =====================================================
 enum MarioModeState {
-  MARIO_MODE_RUNNING = 0,
+  MARIO_MODE_ENTERING_RUN = 0,
+  MARIO_MODE_RUNNING,
+  MARIO_MODE_VICTORY,
+  MARIO_MODE_VICTORY_WAIT,
+  MARIO_MODE_EXITING,
+  MARIO_MODE_SWAP_WAIT,
+  MARIO_MODE_ENTERING_REST,
   MARIO_MODE_REST
 };
 
-static MarioModeState marioModeState = MARIO_MODE_RUNNING;
+static MarioModeState marioModeState = MARIO_MODE_ENTERING_RUN;
 static unsigned long marioModeStateStartMs = 0;
 
 // =====================================================
@@ -360,6 +377,15 @@ static unsigned long jumpStartMs = 0;
 static unsigned long jumpDurationMs = 320;
 
 // =====================================================
+// 踩怪後反彈落地參數
+// =====================================================
+// 不再讓主角落地後滑回原位。
+// 改成踩怪後在 JUMP_DOWN 下落弧線中反彈回原位。
+// 這樣 64x64 小螢幕比較不會有倒退跑或輸送帶感。
+static const int HERO_LAND_X_OFFSET_FROM_BASE = 0;   // 0 = 落回原位；2~4 = 落在原位右邊一點
+static const unsigned long LAND_HOLD_MS = 120;       // 落地後停留時間，越大停越久
+
+// =====================================================
 // 怪物閃爍控制
 // =====================================================
 static unsigned long stompFlashStartMs = 0;
@@ -378,11 +404,58 @@ static unsigned long sceneryNextSpawnMs = 0;
 static int marioWalkFrame = 0;
 static int monsterWalkFrame = 0;
 
+// =====================================================
+// 小工具函式
+// =====================================================
+static bool isSceneryRunningMode() {
+  return marioModeState == MARIO_MODE_ENTERING_RUN ||
+         marioModeState == MARIO_MODE_RUNNING ||
+         marioModeState == MARIO_MODE_EXITING ||
+         marioModeState == MARIO_MODE_ENTERING_REST;
+}
+
+static bool isHeroRunAnimMode() {
+  return marioModeState == MARIO_MODE_ENTERING_RUN ||
+         marioModeState == MARIO_MODE_RUNNING ||
+         marioModeState == MARIO_MODE_EXITING ||
+         marioModeState == MARIO_MODE_ENTERING_REST;
+}
+
+static void resetMonsterState() {
+  monsterVisible = false;
+  currentMonster = nullptr;
+  monsterX = SCR_W;
+  monsterY = marioGroundY;
+
+  stompFlashStartMs = 0;
+  stompFlashToggleCount = 0;
+  stompMonsterDrawVisible = true;
+
+  monsterWalkFrame = 0;
+  monsterLastAnimMs = 0;
+}
+
+static void chooseRandomPlayer(bool avoidSamePlayer) {
+  if (PLAYER_COUNT <= 0) return;
+
+  const PlayerDef* oldPlayer = currentPlayerDef;
+  const PlayerDef* nextPlayer = players[random(PLAYER_COUNT)];
+
+  if (avoidSamePlayer && PLAYER_COUNT > 1) {
+    int guard = 0;
+
+    while (nextPlayer == oldPlayer && guard < 10) {
+      nextPlayer = players[random(PLAYER_COUNT)];
+      guard++;
+    }
+  }
+
+  currentPlayerDef = nextPlayer;
+}
 
 // =====================================================
 // 繪製單一 frame sprite
 // =====================================================
-
 static inline uint16_t marioReadPaletteColor(
   const uint8_t* sheet,
   const uint16_t* palette,
@@ -427,7 +500,6 @@ static void drawMarioBitmapIndexed(
   }
 }
 
-
 static void drawSpriteFrame(
   const uint8_t* sheet,
   const uint16_t* palette,
@@ -468,8 +540,6 @@ static void drawSpriteFrame(
   }
 }
 
-
-
 // =====================================================
 // 景物池管理
 // =====================================================
@@ -478,6 +548,17 @@ static void clearSceneryPool() {
     sceneryPool[i].def = nullptr;
     sceneryPool[i].x = 0;
     sceneryPool[i].active = false;
+  }
+}
+
+static void clearNonCloudScenery() {
+  for (int i = 0; i < MAX_SCENERY_INSTANCES; i++) {
+    if (!sceneryPool[i].active || sceneryPool[i].def == nullptr) continue;
+
+    if (sceneryPool[i].def->type != SCENERY_TYPE_CLOUD) {
+      sceneryPool[i].active = false;
+      sceneryPool[i].def = nullptr;
+    }
   }
 }
 
@@ -549,37 +630,37 @@ static void seedInitialScenery() {
 }
 
 static void updateScenery(unsigned long nowMs) {
-
   if (nowMs - sceneryLastMoveMs < sceneryMoveIntervalMs) {
     return;
   }
+
   sceneryLastMoveMs = nowMs;
 
-//地板移動
-if (marioModeState == MARIO_MODE_RUNNING) {
-  groundX -= SCENERY_GROUND_TILE.speed;
+  bool runningScenery = isSceneryRunningMode();
 
-  if (groundX <= -SCENERY_GROUND_TILE.w) {
-    groundX += SCENERY_GROUND_TILE.w;
+  // 地板移動
+  if (runningScenery) {
+    groundX -= SCENERY_GROUND_TILE.speed;
+
+    if (groundX <= -SCENERY_GROUND_TILE.w) {
+      groundX += SCENERY_GROUND_TILE.w;
+    }
   }
-}
 
-  
   // 先更新目前已存在的景物
   for (int i = 0; i < MAX_SCENERY_INSTANCES; i++) {
     if (!sceneryPool[i].active || sceneryPool[i].def == nullptr) continue;
 
     const SceneryDef* def = sceneryPool[i].def;
 
-    if (marioModeState == MARIO_MODE_RUNNING) {
-      // 跑動模式：全部景物都移動
+    if (runningScenery) {
+      // 進場、跑動、勝利、出場時：全部景物都移動
       sceneryPool[i].x -= def->speed;
     } else {
       // 休息模式：只有雲慢慢飄
       if (def->type == SCENERY_TYPE_CLOUD) {
         sceneryPool[i].x -= 1;
       }
-      // 山、草叢不動
     }
 
     if (sceneryPool[i].x + def->w < 0) {
@@ -592,18 +673,18 @@ if (marioModeState == MARIO_MODE_RUNNING) {
   if (nowMs >= sceneryNextSpawnMs) {
     int rightmost = getRightmostSceneryX();
 
-    if (rightmost <= (SCR_W - random(32, 64))) {     //可生成背景物件的間距
-      if (marioModeState == MARIO_MODE_RUNNING) {
-        // 跑動模式：所有景物都可生成
+    if (rightmost <= (SCR_W - random(32, 64))) {
+      if (runningScenery) {
+        // 非休息模式：所有景物都可生成
         if (spawnRandomScenery()) {
-          sceneryNextSpawnMs = nowMs + random(600, 1400);  //背景物件的間距
+          sceneryNextSpawnMs = nowMs + random(600, 1400);
         } else {
           sceneryNextSpawnMs = nowMs + 120;
         }
       } else {
-        // 休息模式：只生成雲，而且頻率低很多
+        // 休息模式：只生成雲
         if (spawnRandomCloud()) {
-          sceneryNextSpawnMs = nowMs + random(4000, 7000);   //雲的間距
+          sceneryNextSpawnMs = nowMs + random(4000, 7000);
         } else {
           sceneryNextSpawnMs = nowMs + 300;
         }
@@ -641,11 +722,9 @@ static void renderMarioSceneBackground() {
   display.fillScreen(SKY_COLOR);
 
   // 1. 先畫 CLOUD
-  // 先畫的會在後面，所以 CLOUD 會被 BLOCK 蓋住
   drawMarioSceneryLayer(true);
 
   // 2. 再畫其他景物
-  // BLOCK 屬於非 CLOUD，所以會在 CLOUD 後面畫，也就是顯示在 CLOUD 前面
   drawMarioSceneryLayer(false);
 
   // 3. 最後畫地板
@@ -661,9 +740,6 @@ static void renderMarioSceneBackground() {
   }
 }
 
-// =====================================================
-// 畫角色
-// =====================================================
 // =====================================================
 // 畫角色
 // =====================================================
@@ -700,36 +776,50 @@ static void drawMarioSceneActors() {
   // 2. 計算主角 frame
   int marioFrameIndex = 3;
 
-  if (marioModeState == MARIO_MODE_RUNNING) {
+  // 進場、跑動、出場都使用跑步動畫
+  if (isHeroRunAnimMode()) {
     marioFrameIndex = marioWalkFrame % 3;
   }
 
-  if (marioSceneState == MARIO_SCENE_JUMP_UP ||
-      marioSceneState == MARIO_SCENE_STOMP_FLASH ||
-      marioSceneState == MARIO_SCENE_JUMP_DOWN ||
-      marioSceneState == MARIO_SCENE_LAND_HOLD) {
+  // 跳躍、踩怪、下落、落地時固定使用跳躍/攻擊姿勢
+  if (marioModeState == MARIO_MODE_RUNNING &&
+      (marioSceneState == MARIO_SCENE_JUMP_UP ||
+       marioSceneState == MARIO_SCENE_STOMP_FLASH ||
+       marioSceneState == MARIO_SCENE_JUMP_DOWN ||
+       marioSceneState == MARIO_SCENE_LAND_HOLD)) {
     marioFrameIndex = 2;
   }
 
-  if (marioModeState == MARIO_MODE_REST &&
-      marioSceneState == MARIO_SCENE_IDLE) {
-    if (millis() - marioRestAnimStartMs < MARIO_REST_VICTORY_DURATION_MS) {
-      int animIndex = ((millis() - marioRestAnimStartMs) / 150) % 3;
+  // 勝利動畫
+  if (marioModeState == MARIO_MODE_VICTORY) {
+    int animIndex = ((millis() - marioRestAnimStartMs) / 150) % 3;
 
-      if (marioVictorySet == 0) {
-        int frames[3] = {3, 4, 5};
-        marioFrameIndex = frames[animIndex];
-      } else {
-        int frames[3] = {3, 4, 6};
-        marioFrameIndex = frames[animIndex];
-      }
+    if (marioVictorySet == 0) {
+      int frames[3] = {3, 4, 5};
+      marioFrameIndex = frames[animIndex];
     } else {
-      marioFrameIndex = 3;
+      int frames[3] = {3, 4, 6};
+      marioFrameIndex = frames[animIndex];
     }
+  }
+
+  // 勝利後等待、休息時，使用待機姿勢
+  if (marioModeState == MARIO_MODE_VICTORY_WAIT ||
+      marioModeState == MARIO_MODE_REST ||
+      marioModeState == MARIO_MODE_SWAP_WAIT) {
+    marioFrameIndex = 3;
   }
 
   // 3. 畫主角
   int heroDrawY = marioY + (MARIO_FRAME_H - currentPlayerDef->frameH);
+
+  // 踩怪後往左反彈落地時，讓主角面向移動方向。
+  // 這樣視覺上比較像「反彈回來」，不是倒著移動。
+  bool heroMirrorX = false;
+
+  if (marioSceneState == MARIO_SCENE_JUMP_DOWN && marioX > jumpEndX) {
+    heroMirrorX = true;
+  }
 
   drawSpriteFrame(
     currentPlayerDef->sheet,
@@ -740,7 +830,7 @@ static void drawMarioSceneActors() {
     marioFrameIndex,
     marioX,
     heroDrawY,
-    false
+    heroMirrorX
   );
 }
 
@@ -757,9 +847,9 @@ static void renderMarioScene() {
 // 馬力歐跑步動畫
 // =====================================================
 static void updateMarioWalkAnim(unsigned long nowMs) {
-  if (marioModeState != MARIO_MODE_RUNNING) return;
+  if (!isHeroRunAnimMode()) return;
 
-  if (nowMs - marioLastAnimMs >= 120) {
+  if (nowMs - marioLastAnimMs >= 100) {
     marioLastAnimMs = nowMs;
     marioWalkFrame++;
     if (marioWalkFrame >= 3) marioWalkFrame = 0;
@@ -790,39 +880,31 @@ static void updateMonsterWalkAnim(unsigned long nowMs) {
 // 安排下一隻怪物進場
 // =====================================================
 static void scheduleNextMonsterSpawn(unsigned long nowMs) {
-  monsterNextSpawnMs = nowMs + random(1500, 6500);     //怪物進場間格時間
+  monsterNextSpawnMs = nowMs + random(1500, 6500);
 }
 
 // =====================================================
-// 進入跑動模式
+// 進入正常跑動模式
+// 注意：這裡不再隨機換角色。
+// 角色是在 init 或舊角色跑出後才決定。
 // =====================================================
 static void enterRunningMode() {
   unsigned long nowMs = millis();
-  currentPlayerDef = players[random(PLAYER_COUNT)];
-  
+
   marioModeState = MARIO_MODE_RUNNING;
   marioModeStateStartMs = nowMs;
 
-  marioBaseX = 10;
-  marioGroundY = 33;
   marioX = marioBaseX;
   marioY = marioGroundY;
 
   marioSceneState = MARIO_SCENE_IDLE;
 
-  monsterVisible = false;
-  currentMonster = nullptr;
-  monsterX = SCR_W;
-  monsterY = marioGroundY;
-
-  stompFlashStartMs = 0;
-  stompFlashToggleCount = 0;
-  stompMonsterDrawVisible = true;
+  resetMonsterState();
 
   marioWalkFrame = 0;
   monsterWalkFrame = 0;
-  marioLastAnimMs = 0;
-  monsterLastAnimMs = 0;
+  marioLastAnimMs = nowMs;
+  monsterLastAnimMs = nowMs;
 
   seedInitialScenery();
 
@@ -831,11 +913,28 @@ static void enterRunningMode() {
 }
 
 // =====================================================
+// 進入勝利模式
+// 跑滿 RUN_DURATION_MS 後觸發
+// =====================================================
+static void enterVictoryMode(unsigned long nowMs) {
+  marioModeState = MARIO_MODE_VICTORY;
+  marioModeStateStartMs = nowMs;
+
+  marioVictorySet = random(2);
+  marioRestAnimStartMs = nowMs;
+
+  marioSceneState = MARIO_SCENE_IDLE;
+
+  marioX = marioBaseX;
+  marioY = marioGroundY;
+
+  resetMonsterState();
+}
+
+// =====================================================
 // 進入休息模式
-// - 馬力歐待機
-// - 怪物停止
-// - 清掉非雲景物
-// - 只讓雲偶爾慢慢飄過
+// 新角色已經先跑進來，才會進入這裡。
+// 休息時只保留雲，角色在原地待機。
 // =====================================================
 static void enterRestMode() {
   unsigned long nowMs = millis();
@@ -843,27 +942,15 @@ static void enterRestMode() {
   marioModeState = MARIO_MODE_REST;
   marioModeStateStartMs = nowMs;
 
-  marioVictorySet = random(2);
-  marioRestAnimStartMs = nowMs;
-  
   marioSceneState = MARIO_SCENE_IDLE;
 
   marioX = marioBaseX;
   marioY = marioGroundY;
 
-  monsterVisible = false;
-  currentMonster = nullptr;
-  stompMonsterDrawVisible = true;
+  resetMonsterState();
 
   // 清掉非雲景物，讓休息畫面更乾淨
-  for (int i = 0; i < MAX_SCENERY_INSTANCES; i++) {
-    if (!sceneryPool[i].active || sceneryPool[i].def == nullptr) continue;
-
-    if (sceneryPool[i].def->type != SCENERY_TYPE_CLOUD) {
-      sceneryPool[i].active = false;
-      sceneryPool[i].def = nullptr;
-    }
-  }
+  clearNonCloudScenery();
 
   // 安排休息時下一朵雲
   sceneryNextSpawnMs = nowMs + random(1000, 2500);
@@ -912,17 +999,19 @@ static void updateMonsterScene(unsigned long nowMs) {
       updateMonsterWalkAnim(nowMs);
       monsterX -= 1;
 
-      if (monsterX <= 28 && currentMonster != nullptr) {
+      if (monsterX <= 34 && currentMonster != nullptr) {
         marioSceneState = MARIO_SCENE_JUMP_UP;
         marioSceneStateMs = nowMs;
 
         jumpStartX = marioX;
         jumpStartY = marioGroundY;
 
-        jumpMidX = monsterX + (currentMonster->frameW / 2) - (MARIO_FRAME_W / 2) + 1;
+        // 踩怪位置：改用目前角色寬度，讓 Mario / Luigi / Yoshi 都比較準
+        jumpMidX = monsterX + (currentMonster->frameW / 2) - (currentPlayerDef->frameW / 2) - 3;
         jumpMidY = monsterY - MARIO_FRAME_H + 6;
 
-        jumpEndX = monsterX + currentMonster->frameW - 6;
+        // 踩怪後直接反彈回原本位置落地
+        jumpEndX = marioBaseX + HERO_LAND_X_OFFSET_FROM_BASE;
         jumpEndY = marioGroundY;
 
         jumpPeakY = marioGroundY - 18;
@@ -982,7 +1071,10 @@ static void updateMonsterScene(unsigned long nowMs) {
         jumpStartX = marioX;
         jumpStartY = marioY;
         jumpStartMs = nowMs;
-        jumpDurationMs = 260;
+
+        // 反彈回原位的時間。
+        // 越大越慢，越小越快。
+        jumpDurationMs = 300;
       }
       break;
     }
@@ -991,9 +1083,10 @@ static void updateMonsterScene(unsigned long nowMs) {
       float t = (float)(nowMs - jumpStartMs) / (float)jumpDurationMs;
       if (t > 1.0f) t = 1.0f;
 
+      // 從踩怪位置反彈回 marioBaseX
       marioX = jumpStartX + (int)((jumpEndX - jumpStartX) * t);
 
-      int downPeakY = jumpStartY - 4;
+      int downPeakY = jumpStartY - 6;
       float arc = 4.0f * t * (1.0f - t);
       int baseY = jumpStartY + (int)((jumpEndY - jumpStartY) * t);
       marioY = baseY - (int)(arc * (jumpStartY - downPeakY));
@@ -1009,27 +1102,29 @@ static void updateMonsterScene(unsigned long nowMs) {
     }
 
     case MARIO_SCENE_LAND_HOLD: {
-      if (nowMs - marioSceneStateMs >= 250) {
-        marioSceneState = MARIO_SCENE_FINISH;
+      // 現在主角已經在下落弧線中回到原位了，
+      // 所以落地後不再移動，只短暫停一下就恢復跑步。
+      if (nowMs - marioSceneStateMs >= LAND_HOLD_MS) {
+        marioX = marioBaseX;
+        marioY = marioGroundY;
+
+        marioSceneState = MARIO_SCENE_IDLE;
         marioSceneStateMs = nowMs;
+
+        scheduleNextMonsterSpawn(nowMs);
       }
       break;
     }
 
     case MARIO_SCENE_FINISH: {
-      if (marioX > marioBaseX) {
-        marioX -= 1;
-        if (marioX < marioBaseX) marioX = marioBaseX;
-      } else if (marioX < marioBaseX) {
-        marioX += 1;
-        if (marioX > marioBaseX) marioX = marioBaseX;
-      }
+      // 安全備用狀態。
+      marioX = marioBaseX;
+      marioY = marioGroundY;
 
-      if (marioX == marioBaseX) {
-        marioY = marioGroundY;
-        marioSceneState = MARIO_SCENE_IDLE;
-        scheduleNextMonsterSpawn(nowMs);
-      }
+      marioSceneState = MARIO_SCENE_IDLE;
+      marioSceneStateMs = nowMs;
+
+      scheduleNextMonsterSpawn(nowMs);
       break;
     }
 
@@ -1042,14 +1137,129 @@ static void updateMonsterScene(unsigned long nowMs) {
 // 更新大模式循環
 // =====================================================
 static void updateMarioModeCycle(unsigned long nowMs) {
-  if (marioModeState == MARIO_MODE_RUNNING) {
-    if (nowMs - marioModeStateStartMs >= RUN_DURATION_MS) {
-      enterRestMode();
+  switch (marioModeState) {
+
+    case MARIO_MODE_ENTERING_RUN: {
+      // 一開始角色從左側跑進來，到達 marioBaseX 後才正式開始 60 秒跑動。
+      marioY = marioGroundY;
+
+      if (marioX < marioBaseX) {
+        marioX += HERO_ENTER_STEP_PX;
+        if (marioX > marioBaseX) marioX = marioBaseX;
+      }
+
+      if (marioX == marioBaseX) {
+        marioModeState = MARIO_MODE_RUNNING;
+        marioModeStateStartMs = nowMs;
+
+        marioSceneState = MARIO_SCENE_IDLE;
+
+        resetMonsterState();
+        scheduleNextMonsterSpawn(nowMs);
+      }
+      break;
     }
-  } else {
-    if (nowMs - marioModeStateStartMs >= REST_DURATION_MS) {
-      enterRunningMode();
+
+    case MARIO_MODE_RUNNING: {
+      // 跑滿 60 秒後，等目前踩怪流程結束，再進入勝利動畫。
+      // 這樣不會踩怪踩到一半突然切狀態。
+      if (nowMs - marioModeStateStartMs >= RUN_DURATION_MS &&
+          marioSceneState == MARIO_SCENE_IDLE &&
+          !monsterVisible) {
+        enterVictoryMode(nowMs);
+      }
+      break;
     }
+
+    case MARIO_MODE_VICTORY: {
+      // 勝利動畫播放完，進入 2 秒等待。
+      if (nowMs - marioRestAnimStartMs >= MARIO_VICTORY_DURATION_MS) {
+        marioModeState = MARIO_MODE_VICTORY_WAIT;
+        marioModeStateStartMs = nowMs;
+
+        marioX = marioBaseX;
+        marioY = marioGroundY;
+      }
+      break;
+    }
+
+    case MARIO_MODE_VICTORY_WAIT: {
+      // 勝利後等待 2 秒，再往右跑出螢幕。
+      if (nowMs - marioModeStateStartMs >= VICTORY_AFTER_WAIT_MS) {
+        marioModeState = MARIO_MODE_EXITING;
+        marioModeStateStartMs = nowMs;
+
+        marioX = marioBaseX;
+        marioY = marioGroundY;
+
+        marioWalkFrame = 0;
+        marioLastAnimMs = nowMs;
+      }
+      break;
+    }
+
+    case MARIO_MODE_EXITING: {
+      // 舊角色往右跑出螢幕外。
+      marioY = marioGroundY;
+      marioX += HERO_EXIT_STEP_PX;
+
+      if (marioX >= SCR_W) {
+        marioModeState = MARIO_MODE_SWAP_WAIT;
+        marioModeStateStartMs = nowMs;
+
+        marioX = SCR_W;
+        marioY = marioGroundY;
+
+        resetMonsterState();
+      }
+      break;
+    }
+
+    case MARIO_MODE_SWAP_WAIT: {
+      // 舊角色已經離開，等待 1 秒，再選下一位角色跑進來。
+      if (nowMs - marioModeStateStartMs >= CHARACTER_SWAP_WAIT_MS) {
+        chooseRandomPlayer(true);
+
+        marioX = -currentPlayerDef->frameW;
+        marioY = marioGroundY;
+
+        marioWalkFrame = 0;
+        marioLastAnimMs = nowMs;
+
+        resetMonsterState();
+
+        marioModeState = MARIO_MODE_ENTERING_REST;
+        marioModeStateStartMs = nowMs;
+      }
+      break;
+    }
+
+    case MARIO_MODE_ENTERING_REST: {
+      // 下一位角色從左側跑進來，到定位後才正式開始休息 5 分鐘。
+      marioY = marioGroundY;
+
+      if (marioX < marioBaseX) {
+        marioX += HERO_ENTER_STEP_PX;
+        if (marioX > marioBaseX) marioX = marioBaseX;
+      }
+
+      if (marioX == marioBaseX) {
+        enterRestMode();
+      }
+      break;
+    }
+
+    case MARIO_MODE_REST: {
+      // 休息 5 分鐘結束後，同一位已經在畫面中的角色直接開始跑動。
+      // 不重新 random，因為角色已經在休息前換好了。
+      if (nowMs - marioModeStateStartMs >= REST_DURATION_MS) {
+        enterRunningMode();
+      }
+      break;
+    }
+
+    default:
+      break;
   }
 }
 
@@ -1058,22 +1268,40 @@ static void updateMarioModeCycle(unsigned long nowMs) {
 // =====================================================
 static void MarioModeInit() {
   if (!ModefirstRun) return;
+
   randomSeed(millis());
-  currentPlayerDef = &PLAYER_MARIO;
-  
+  unsigned long nowMs = millis();
+
   marioBaseX = 10;
   marioGroundY = 33;
-  marioX = marioBaseX;
+
+  // 一開始就隨機選角色，但不瞬間出現。
+  // 角色會從左側跑進畫面。
+  chooseRandomPlayer(false);
+
+  marioX = -currentPlayerDef->frameW;
   marioY = marioGroundY;
 
+  marioSceneState = MARIO_SCENE_IDLE;
+  marioModeState = MARIO_MODE_ENTERING_RUN;
+  marioModeStateStartMs = nowMs;
+
+  resetMonsterState();
+
+  marioWalkFrame = 0;
+  monsterWalkFrame = 0;
+  marioLastAnimMs = nowMs;
+  monsterLastAnimMs = nowMs;
+
   seedInitialScenery();
-  enterRunningMode();
+
+  sceneryNextSpawnMs = nowMs + random(250, 700);
+
   ModefirstRun = false;
 }
 
 // =====================================================
 // 主函式
-// 跑 60 秒 -> 休息 15 秒 -> 再跑
 // =====================================================
 void MarioMode() {
   MarioModeInit();

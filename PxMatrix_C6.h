@@ -55,17 +55,51 @@ public:
     }
   }
 
-  void setRGBPins(uint8_t r1, uint8_t g1, uint8_t b1,
-                  uint8_t r2, uint8_t g2, uint8_t b2,
-                  uint8_t clk) {
-    _R1 = r1;
-    _G1 = g1;
-    _B1 = b1;
-    _R2 = r2;
-    _G2 = g2;
-    _B2 = b2;
-    _CLK_PIN = clk;
-  }
+void setRGBPins(uint8_t r1, uint8_t g1, uint8_t b1,
+                uint8_t r2, uint8_t g2, uint8_t b2,
+                uint8_t clk) {
+
+  // 先算好新的 GPIO mask
+  uint32_t r1Mask = bitMask(r1);
+  uint32_t g1Mask = bitMask(g1);
+  uint32_t b1Mask = bitMask(b1);
+
+  uint32_t r2Mask = bitMask(r2);
+  uint32_t g2Mask = bitMask(g2);
+  uint32_t b2Mask = bitMask(b2);
+
+  uint32_t clkMask = bitMask(clk);
+
+  // 避免正在掃描時剛好切換 RGB mapping
+  noInterrupts();
+
+  _R1 = r1;
+  _G1 = g1;
+  _B1 = b1;
+
+  _R2 = r2;
+  _G2 = g2;
+  _B2 = b2;
+
+  _CLK_PIN = clk;
+
+  // 立即更新高速 GPIO Mask
+  _R1_MASK = r1Mask;
+  _G1_MASK = g1Mask;
+  _B1_MASK = b1Mask;
+
+  _R2_MASK = r2Mask;
+  _G2_MASK = g2Mask;
+  _B2_MASK = b2Mask;
+
+  _CLK_MASK = clkMask;
+
+  _RGB_MASK_ALL =
+      _R1_MASK | _G1_MASK | _B1_MASK |
+      _R2_MASK | _G2_MASK | _B2_MASK;
+
+  interrupts();
+}
 
   void begin() {
     pinMode(_LATCH_PIN, OUTPUT);

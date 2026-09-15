@@ -1,6 +1,40 @@
 #include "Metro.h"
 
 // =====================================================
+// Metro 2D / 2.5D 整合控制器
+//
+// METRO_STARTUP_MODE 可設定為：
+//   METRO_STARTUP_2D     固定使用 2D
+//   METRO_STARTUP_25D    固定使用 2.5D
+//   METRO_STARTUP_RANDOM 每次進入 MetroMode 時隨機選一種
+//
+// 模式只會在 initSelectedMetroMode() 決定一次；之後 MetroMode()
+// 會持續執行同一模式，直到外部重新把 ModefirstRun 設為 true。
+// =====================================================
+
+enum MetroStartupMode : uint8_t {
+  METRO_STARTUP_2D = 0,
+  METRO_STARTUP_25D,
+  METRO_STARTUP_RANDOM
+};
+
+// 在這裡選擇啟動策略。
+static const MetroStartupMode METRO_STARTUP_MODE =
+  METRO_STARTUP_RANDOM;
+
+static const uint8_t METRO_ACTIVE_2D = 0;
+static const uint8_t METRO_ACTIVE_25D = 1;
+
+static uint8_t metroActiveMode =
+  METRO_ACTIVE_25D;
+
+// =====================================================
+// 2D Metro 實作
+// =====================================================
+namespace Metro2D {
+
+
+// =====================================================
 // Metro Mode DEMO
 // 捷運進站效果
 // =====================================================
@@ -1709,7 +1743,7 @@ static void renderMetroScene() {
 // =====================================================
 // 初始化
 // =====================================================
-static void MetroModeInit() {
+static void init() {
   if (!ModefirstRun) return;
 
   randomSeed(millis());
@@ -1752,8 +1786,8 @@ static void MetroModeInit() {
 // =====================================================
 // 主函式
 // =====================================================
-void MetroMode() {
-  MetroModeInit();
+static void run() {
+  init();
 
   unsigned long nowMs = millis();
 
@@ -1763,4 +1797,1886 @@ void MetroMode() {
   renderMetroScene();
 
   wait_with_display(METRO_FRAME_DELAY_MS);
+}
+
+}  // namespace Metro2D
+
+// =====================================================
+// 2.5D Metro 實作
+// =====================================================
+namespace Metro25D {
+
+
+// =====================================================
+// Metro Mode 2.5D - RGB565
+//
+// Metro.h 內的主要圖資使用 8 位元索引圖＋RGB565 色盤：
+//   const uint8_t  METRO_GROUND[] PROGMEM;
+//   const uint16_t METRO_GROUND_PALETTE[] PROGMEM;
+//   const uint8_t  METRO_TILE1[] PROGMEM;
+//   const uint16_t METRO_TILE1_PALETTE[] PROGMEM;
+//   const uint8_t  METRO_TRAIN[] PROGMEM;
+//   const uint16_t METRO_TRAIN_PALETTE[] PROGMEM;
+//
+// 所有索引圖的索引 0 都視為透明色。
+// =====================================================
+
+static const int METRO_SCR_W = 64;
+static const int METRO_SCR_H = 64;
+
+static const uint16_t METRO_CLEAR_COLOR = 0x9492;
+static const uint8_t METRO_TRANSPARENT_INDEX = 0;
+
+// =====================================================
+// 圖片尺寸
+// =====================================================
+
+static const int GROUND_SHEET_W = 160;
+static const int GROUND_SHEET_H = 20;
+static const int GROUND_FRAME_W = 40;
+static const int GROUND_FRAME_H = 20;
+
+static const int TILE_SHEET_W = 120;
+static const int TILE_SHEET_H = 39;
+static const int TILE_FRAME_W = 60;
+static const int TILE_FRAME_H = 39;
+
+static const int K_TRAIN_W = 96;
+static const int K_TRAIN_H = 86;
+
+
+// =====================================================
+// 車站站牌圖資（8 位元索引圖＋RGB565 色盤）
+//
+// Metro.h 中每一張站牌由兩個陣列組成：
+// 1. METRO_STATION_xxx：每個像素儲存色盤索引
+// 2. METRO_STATION_xxx_PALETTE：索引對應的 RGB565 顏色
+//
+// 索引 0 視為透明色，不會繪製。
+// =====================================================
+
+static const int METRO_STATION_Y = 2;
+
+struct MetroStationDef {
+  const uint8_t* sprite;
+  const uint16_t* palette;
+  int w;
+  int h;
+};
+
+static const MetroStationDef metroStationList[] = {
+  { METRO_STATION_01,   METRO_STATION_01_PALETTE,   59, 25 },  // 哈瑪星
+  { METRO_STATION_02,   METRO_STATION_02_PALETTE,   59, 25 },  // 鹽埕埔
+  { METRO_STATION_04,   METRO_STATION_04_PALETTE,   48, 25 },  // 前金
+  { METRO_STATION_C,    METRO_STATION_C_PALETTE,    61, 25 },  // 美麗島
+  { METRO_STATION_06,   METRO_STATION_06_PALETTE,   72, 25 },  // 信義國小
+  { METRO_STATION_07,   METRO_STATION_07_PALETTE,   72, 25 },  // 文化中心
+  { METRO_STATION_08,   METRO_STATION_08_PALETTE,   59, 25 },  // 五塊厝
+  { METRO_STATION_09,   METRO_STATION_09_PALETTE,  100, 25 },  // 苓雅運動園區
+  { METRO_STATION_10,   METRO_STATION_10_PALETTE,   59, 25 },  // 衛武營
+  { METRO_STATION_11,   METRO_STATION_11_PALETTE,   72, 25 },  // 鳳山西站
+  { METRO_STATION_12,   METRO_STATION_12_PALETTE,   48, 25 },  // 鳳山
+  { METRO_STATION_13,   METRO_STATION_13_PALETTE,   48, 25 },  // 大東
+  { METRO_STATION_14,   METRO_STATION_14_PALETTE,   69, 25 },  // 鳳山國中
+  { METRO_STATION_15,   METRO_STATION_15_PALETTE,   48, 25 },  // 大寮
+
+  { METRO_STATION_R3,   METRO_STATION_R3_PALETTE,   48, 25 },  // 小港
+  { METRO_STATION_R4,   METRO_STATION_R4_PALETTE,   72, 25 },  // 高雄機場
+  { METRO_STATION_R4A,  METRO_STATION_R4A_PALETTE,  48, 25 },  // 草衙
+  { METRO_STATION_R5,   METRO_STATION_R5_PALETTE,   72, 25 },  // 前鎮高中
+  { METRO_STATION_R6,   METRO_STATION_R6_PALETTE,   48, 25 },  // 凱旋
+  { METRO_STATION_R7,   METRO_STATION_R7_PALETTE,   48, 25 },  // 獅甲
+  { METRO_STATION_R8,   METRO_STATION_R8_PALETTE,   72, 25 },  // 三多商圈
+  { METRO_STATION_R9,   METRO_STATION_R9_PALETTE,   72, 25 },  // 中央公園
+
+  { METRO_STATION_R11,  METRO_STATION_R11_PALETTE,  72, 25 },  // 高雄車站
+  { METRO_STATION_R12,  METRO_STATION_R12_PALETTE,  48, 25 },  // 後驛
+  { METRO_STATION_R13,  METRO_STATION_R13_PALETTE,  59, 25 },  // 凹子底
+  { METRO_STATION_R14,  METRO_STATION_R14_PALETTE,  48, 25 },  // 巨蛋
+  { METRO_STATION_R15,  METRO_STATION_R15_PALETTE,  72, 25 },  // 生態園區
+  { METRO_STATION_R16,  METRO_STATION_R16_PALETTE,  48, 25 },  // 左營
+  { METRO_STATION_R17,  METRO_STATION_R17_PALETTE,  48, 25 },  // 世運
+  { METRO_STATION_R18,  METRO_STATION_R18_PALETTE,  72, 25 },  // 油廠國小
+  { METRO_STATION_R19,  METRO_STATION_R19_PALETTE, 100, 25 },  // 楠梓科技園區
+  { METRO_STATION_R20,  METRO_STATION_R20_PALETTE,  48, 25 },  // 後勁
+  { METRO_STATION_R21,  METRO_STATION_R21_PALETTE,  72, 25 },  // 都會公園
+  { METRO_STATION_R22,  METRO_STATION_R22_PALETTE,  48, 25 },  // 青埔
+  { METRO_STATION_R22A, METRO_STATION_R22A_PALETTE, 72, 25 },  // 橋頭糖廠
+  { METRO_STATION_R23,  METRO_STATION_R23_PALETTE,  72, 25 },  // 橋頭車站
+  { METRO_STATION_R24,  METRO_STATION_R24_PALETTE,  72, 25 },  // 岡山高醫
+  { METRO_STATION_RK1,  METRO_STATION_RK1_PALETTE,  72, 25 }   // 岡山車站
+};
+
+// 路線索引表。每條路線第一站都是美麗島（索引 3）。
+static const uint8_t metroRouteWest[] = {
+  3, 2, 1, 0
+};
+
+static const uint8_t metroRouteEast[] = {
+  3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13
+};
+
+static const uint8_t metroRouteSouth[] = {
+  3, 21, 20, 19, 18, 17, 16, 15, 14
+};
+
+static const uint8_t metroRouteNorth[] = {
+  3, 22, 23, 24, 25, 26, 27, 28, 29,
+  30, 31, 32, 33, 34, 35, 36, 37
+};
+
+static const uint8_t METRO_ROUTE_WEST = 0;
+static const uint8_t METRO_ROUTE_EAST = 1;
+static const uint8_t METRO_ROUTE_SOUTH = 2;
+static const uint8_t METRO_ROUTE_NORTH = 3;
+
+static const uint8_t METRO_CENTER_STATION_INDEX = 3;
+
+// =====================================================
+// Frame 編號
+// =====================================================
+
+static const uint8_t GROUND_RAIL = 0;
+static const uint8_t GROUND_FLOOR = 1;
+static const uint8_t GROUND_DECOR_2 = 2;
+static const uint8_t GROUND_DECOR_3 = 3;
+
+static const uint8_t TILE_UPPER = 0;
+static const uint8_t TILE_LOWER = 1;
+
+// =====================================================
+// 初始世界座標
+// =====================================================
+
+// 鐵軌：
+// (30,24) (50,34) (70,44) (90,54)
+static const int RAIL_BASE_X = 30;
+static const int RAIL_BASE_Y = 24;
+static const int RAIL_STEP_X = 20;
+static const int RAIL_STEP_Y = 10;
+
+// 上月台：
+// (48,0) (78,15) (108,30)
+static const int UPPER_BASE_X = 48;
+static const int UPPER_BASE_Y = 0;
+
+// 下月台：
+// (0,24) (30,39) (60,54)
+static const int LOWER_BASE_X = 0;
+static const int LOWER_BASE_Y = 24;
+
+static const int PLATFORM_STEP_X = 30;
+static const int PLATFORM_STEP_Y = 15;
+
+// 地板：
+// 月台座標先 Y + 15，
+// 再套用 X + 20、Y - 9。
+// 合計為 X + 20、Y + 6。
+static const int FLOOR_OFFSET_X = 20;
+static const int FLOOR_OFFSET_Y = 6;
+
+// 車廂
+static const float TRAIN_START_X = -36.0f;
+static const float TRAIN_START_Y = -52.0f;
+
+static const float TRAIN_STOP_X = 29.0f;
+static const float TRAIN_STOP_Y = -19.0f;
+
+// CAM
+static const float CAMERA_HOME_X = 50.0f;
+static const float CAMERA_LEAVE_X = 85.0f;
+static const float CAMERA_Y = 2.0f;
+
+// =====================================================
+// 動畫時間設定
+
+// =====================================================
+
+// 模式開始後，初始畫面停留的時間。
+static const unsigned long FIRST_WAIT_MS = 3000UL;
+
+// 列車從起始位置移動到停靠位置所需的時間。
+// 列車總位移約為 65 個像素，畫面約每 30 ms 更新一次。
+// 1950 ms = 1.95 秒。
+static const unsigned long TRAIN_IN_MS = 1950UL;
+
+// 列車進站並停靠後，月台畫面維持不動的時間。
+// 此階段會顯示時鐘文字，也可在未來加入開門或乘客動畫。
+// 10000 ms = 15 秒。
+static const unsigned long PLATFORM_WAIT_MS = 15000UL;
+
+// 攝影機從初始位置平滑移動到列車離站視角所需的時間。
+static const unsigned long CAMERA_MOVE_MS = 2000UL;
+
+// 攝影機移動到離站視角後，在月台開始移動之前額外等待的時間。 2 秒。
+static const unsigned long BEFORE_RUN_WAIT_MS = 2000UL;
+
+// 月台場景開始移動並由慢速逐漸加速到最高速度的時間。
+// 此階段仍以月台圖資為主。10 秒。
+static const unsigned long PLATFORM_ACCEL_MS = 10000UL;
+
+// 地板圖資完整顯示後，場景以最高速度持續移動的時間。15 秒。
+static const unsigned long GROUND_RUN_MS = 15000UL;
+
+// 地板切換回月台後，場景由最高速度逐漸減速到完全停止所需的時間。10 秒。
+static const unsigned long PLATFORM_DECEL_MS = 10000UL;
+
+// 月台完全停止後，畫面繼續停留的時間。此階段結束後，攝影機會移回初始位置。 3 秒。
+static const unsigned long STOP_WAIT_MS = 3000UL;
+
+// 月台圖資與地板圖資進行滑動切換所需的時間。
+// 新圖資會從畫面右側逐漸滑入，取代原本的圖資。
+// 數值越大，切換速度越慢；數值越小，切換速度越快。0.8 秒。
+static const unsigned long SURFACE_TRANSITION_MS = 800UL;
+
+// 車站站牌每移動 1 像素的時間。
+// 數值越小，站牌滑入與滑出越快。
+static const unsigned long STATION_MOVE_INTERVAL_MS = 35UL;
+
+// 站牌滑入中央後的停留時間。
+static const unsigned long STATION_HOLD_MS = 5000UL;
+
+// 每次完成狀態更新與畫面繪製後的等待時間。
+// 此數值決定動畫更新頻率。
+// 30 ms 約等於每秒更新 33 次：1000 ÷ 30 ≈ 33 FPS。
+static const unsigned long FRAME_DELAY_MS = 30UL;
+
+
+
+// =====================================================
+// 場景移動速度
+//
+// 單位：X pixel / second。
+// Y 移動量固定為 X 的一半。
+// =====================================================
+
+static const float SCROLL_START_PPS = 2.0f;
+static const float SCROLL_MAX_PPS = 36.0f;
+
+// 480 同時可被：
+// 鐵軌間距 20
+// 月台間距 30
+// 2222/3333 的 160px 週期
+// 整除。
+static const float SCROLL_WRAP_PX = 480.0f;
+
+// =====================================================
+// 狀態機
+// =====================================================
+
+enum MetroState : uint8_t {
+  METRO_FIRST_WAIT = 0,
+  METRO_TRAIN_IN,
+  METRO_PLATFORM_WAIT,
+  METRO_CAMERA_TO_LEAVE,
+  METRO_WAIT_BEFORE_RUN,
+  METRO_PLATFORM_ACCEL,
+
+  // 月台加速完成後，站牌滑入、停留、滑出。
+  METRO_STATION_IN,
+  METRO_STATION_HOLD,
+  METRO_STATION_OUT,
+
+  METRO_GROUND_RUN,
+  METRO_PLATFORM_DECEL,
+  METRO_STOP_WAIT,
+  METRO_CAMERA_HOME
+};
+
+static MetroState metroState = METRO_FIRST_WAIT;
+
+static unsigned long metroStateStartMs = 0;
+static unsigned long metroLastMotionMs = 0;
+
+// =====================================================
+// 場景變數
+// =====================================================
+
+static float metroCameraX = CAMERA_HOME_X;
+
+static float metroTrainX = TRAIN_START_X;
+static float metroTrainY = TRAIN_START_Y;
+
+// 正值表示鐵軌、月台、地板已往左上移動。
+static float metroScrollPx = 0.0f;
+static float metroScrollSpeedPps = 0.0f;
+
+// 0 = 2222 3333
+// 1 = 3333 2222
+static uint8_t metroGroundPatternOffset = 0;
+
+// 圖資滑動切換遮罩
+static bool metroSurfaceClipEnabled = false;
+
+// 只有畫面 X 大於等於此位置的像素才會繪製
+static int metroSurfaceClipX = METRO_SCR_W;
+
+
+// =====================================================
+// 車站站牌控制
+// =====================================================
+
+// 目前顯示的站牌索引。
+static uint8_t metroCurrentStationIndex =
+  METRO_CENTER_STATION_INDEX;
+
+// 目前路線與上一條路線。
+static uint8_t metroCurrentRoute = METRO_ROUTE_EAST;
+static uint8_t metroLastRoute = 255;
+
+// 目前位於路線索引表中的位置。
+static int metroRoutePos = 0;
+
+// 1 表示由美麗島前往終點；-1 表示由終點返回美麗島。
+static int metroRouteDir = 1;
+
+// 站牌目前在螢幕上的 X 座標。
+static int metroStationX = METRO_SCR_W;
+
+// 上一次移動站牌的時間。
+static unsigned long metroStationLastMoveMs = 0;
+
+// =====================================================
+// 數學工具
+// =====================================================
+
+static float clamp01(float value) {
+  if (value < 0.0f) {
+    return 0.0f;
+  }
+
+  if (value > 1.0f) {
+    return 1.0f;
+  }
+
+  return value;
+}
+
+static float smoothStep(float value) {
+  value = clamp01(value);
+
+  return value * value * (3.0f - 2.0f * value);
+}
+
+static int roundToInt(float value) {
+  if (value >= 0.0f) {
+    return (int)(value + 0.5f);
+  }
+
+  return (int)(value - 0.5f);
+}
+
+static int floorDiv(int value, int divisor) {
+  int quotient = value / divisor;
+  int remainder = value % divisor;
+
+  if (remainder != 0 && value < 0) {
+    quotient--;
+  }
+
+  return quotient;
+}
+
+static float sceneShiftX() {
+  return -metroScrollPx;
+}
+
+static float sceneShiftY() {
+  return -metroScrollPx * 0.5f;
+}
+
+// =====================================================
+// 索引圖＋RGB565 色盤繪製
+//
+// 圖片陣列儲存 uint8_t 色盤索引，
+// 實際顏色由對應的 RGB565 palette 取得。
+// 支援：
+// 1. 世界座標
+// 2. CAM 裁切
+// 3. Frame 裁切
+// 4. 洋紅色透明
+// =====================================================
+
+static void drawFrame565World(
+  float worldX,
+  float worldY,
+  int sheetW,
+  int sheetH,
+  int srcX,
+  int srcY,
+  int frameW,
+  int frameH,
+  const uint8_t* sprite,
+  const uint16_t* palette
+) {
+  if (!sprite || !palette) {
+    return;
+  }
+
+  if (srcX < 0 || srcY < 0) {
+    return;
+  }
+
+  if (srcX + frameW > sheetW) {
+    return;
+  }
+
+  if (srcY + frameH > sheetH) {
+    return;
+  }
+
+  int screenX = roundToInt(
+    worldX - metroCameraX
+  );
+
+  int screenY = roundToInt(
+    worldY - CAMERA_Y
+  );
+
+  // 整張圖片在畫面外。
+  if (screenX >= METRO_SCR_W) {
+    return;
+  }
+
+  if (screenY >= METRO_SCR_H) {
+    return;
+  }
+
+  if (screenX + frameW <= 0) {
+    return;
+  }
+
+  if (screenY + frameH <= 0) {
+    return;
+  }
+
+  int beginX = 0;
+  int beginY = 0;
+  int endX = frameW;
+  int endY = frameH;
+
+  if (screenX < 0) {
+    beginX = -screenX;
+  }
+
+  if (screenY < 0) {
+    beginY = -screenY;
+  }
+
+  if (screenX + endX > METRO_SCR_W) {
+    endX = METRO_SCR_W - screenX;
+  }
+
+  if (screenY + endY > METRO_SCR_H) {
+    endY = METRO_SCR_H - screenY;
+  }
+
+  for (int frameY = beginY; frameY < endY; frameY++) {
+    int drawY = screenY + frameY;
+
+    uint32_t sourceRow =
+      (uint32_t)(srcY + frameY) *
+      (uint32_t)sheetW;
+
+    for (int frameX = beginX; frameX < endX; frameX++) {
+      int drawX = screenX + frameX;
+
+      uint32_t sourcePos =
+        sourceRow +
+        (uint32_t)(srcX + frameX);
+
+      uint8_t paletteIndex =
+        pgm_read_byte(&(sprite[sourcePos]));
+
+      // 索引 0 是透明背景。
+      if (paletteIndex == METRO_TRANSPARENT_INDEX) {
+        continue;
+      }
+
+      // 月台與地板切換時，
+      // 只繪製遮罩右側的像素。
+      if (
+        metroSurfaceClipEnabled &&
+        drawX < metroSurfaceClipX
+      ) {
+        continue;
+      }
+
+      uint16_t color =
+        pgm_read_word(&(palette[paletteIndex]));
+
+      display.drawPixel(
+        drawX,
+        drawY,
+        color
+      );
+    }
+  }
+}
+
+// =====================================================
+// 繪製 8 位元索引圖＋RGB565 色盤
+//
+// sprite 中每個像素只儲存一個色盤索引。
+// palette 中才是實際的 RGB565 顏色。
+// 索引 0 當作透明色。
+// =====================================================
+
+static void drawIndexedSprite565(
+  int x,
+  int y,
+  int w,
+  int h,
+  const uint8_t* sprite,
+  const uint16_t* palette
+) {
+  if (!sprite || !palette) {
+    return;
+  }
+
+  for (int sourceY = 0; sourceY < h; sourceY++) {
+    int drawY = y + sourceY;
+
+    if (drawY < 0 || drawY >= METRO_SCR_H) {
+      continue;
+    }
+
+    uint32_t sourceRow =
+      (uint32_t)sourceY * (uint32_t)w;
+
+    for (int sourceX = 0; sourceX < w; sourceX++) {
+      int drawX = x + sourceX;
+
+      if (drawX < 0 || drawX >= METRO_SCR_W) {
+        continue;
+      }
+
+      uint32_t sourcePos =
+        sourceRow + (uint32_t)sourceX;
+
+      uint8_t paletteIndex =
+        pgm_read_byte(&(sprite[sourcePos]));
+
+      // 色盤索引 0 為透明背景。
+      if (paletteIndex == 0) {
+        continue;
+      }
+
+      uint16_t color =
+        pgm_read_word(&(palette[paletteIndex]));
+
+      display.drawPixel(
+        drawX,
+        drawY,
+        color
+      );
+    }
+  }
+}
+
+// =====================================================
+// 圖資 Frame 包裝
+// =====================================================
+
+static void drawGroundFrame(
+  float x,
+  float y,
+  uint8_t frame
+) {
+  if (frame > 3) {
+    return;
+  }
+
+  drawFrame565World(
+    x,
+    y,
+    GROUND_SHEET_W,
+    GROUND_SHEET_H,
+    frame * GROUND_FRAME_W,
+    0,
+    GROUND_FRAME_W,
+    GROUND_FRAME_H,
+    METRO_GROUND,
+    METRO_GROUND_PALETTE
+  );
+}
+
+static void drawTileFrame(
+  float x,
+  float y,
+  uint8_t frame
+) {
+  if (frame > 1) {
+    return;
+  }
+
+  drawFrame565World(
+    x,
+    y,
+    TILE_SHEET_W,
+    TILE_SHEET_H,
+    frame * TILE_FRAME_W,
+    0,
+    TILE_FRAME_W,
+    TILE_FRAME_H,
+    METRO_TILE1,
+    METRO_TILE1_PALETTE
+  );
+}
+
+static void drawTrainFrame0(
+  float x,
+  float y
+) {
+  drawFrame565World(
+    x,
+    y,
+    K_TRAIN_W,
+    K_TRAIN_H,
+    0,
+    0,
+    K_TRAIN_W,
+    K_TRAIN_H,
+    METRO_TRAIN2,
+    METRO_TRAIN2_PALETTE
+  );
+}
+
+// =====================================================
+// 計算目前 CAM 需要補畫的圖塊範圍
+// =====================================================
+
+static void visibleRepeatRange(
+  float baseX,
+  int stepX,
+  int frameW,
+  int& firstK,
+  int& lastK
+) {
+  float shiftedBaseX =
+    baseX + sceneShiftX();
+
+  float leftWorld =
+    metroCameraX - (float)frameW;
+
+  float rightWorld =
+    metroCameraX + (float)METRO_SCR_W;
+
+  firstK =
+    (int)floorf(
+      (leftWorld - shiftedBaseX) /
+      (float)stepX
+    ) - 1;
+
+  lastK =
+    (int)ceilf(
+      (rightWorld - shiftedBaseX) /
+      (float)stepX
+    ) + 1;
+
+  // 初始座標從 k=0 開始。
+  // 場景往左上移動時，用正 k 補右下畫面。
+  if (firstK < 0) {
+    firstK = 0;
+  }
+}
+
+// =====================================================
+// 重複繪製 METRO_GROUND
+// =====================================================
+
+static void drawGroundLine(
+  float baseX,
+  float baseY,
+  int stepX,
+  int stepY,
+  uint8_t frame
+) {
+  int firstK;
+  int lastK;
+
+  visibleRepeatRange(
+    baseX,
+    stepX,
+    GROUND_FRAME_W,
+    firstK,
+    lastK
+  );
+
+  float shiftX = sceneShiftX();
+  float shiftY = sceneShiftY();
+
+  for (int k = firstK; k <= lastK; k++) {
+    float x =
+      baseX +
+      (float)(k * stepX) +
+      shiftX;
+
+    float y =
+      baseY +
+      (float)(k * stepY) +
+      shiftY;
+
+    drawGroundFrame(
+      x,
+      y,
+      frame
+    );
+  }
+}
+
+// =====================================================
+// 重複繪製 METRO_TILE1
+// =====================================================
+
+static void drawTileLine(
+  float baseX,
+  float baseY,
+  uint8_t frame
+) {
+  int firstK;
+  int lastK;
+
+  visibleRepeatRange(
+    baseX,
+    PLATFORM_STEP_X,
+    TILE_FRAME_W,
+    firstK,
+    lastK
+  );
+
+  float shiftX = sceneShiftX();
+  float shiftY = sceneShiftY();
+
+  for (int k = firstK; k <= lastK; k++) {
+    float x =
+      baseX +
+      (float)(k * PLATFORM_STEP_X) +
+      shiftX;
+
+    float y =
+      baseY +
+      (float)(k * PLATFORM_STEP_Y) +
+      shiftY;
+
+    drawTileFrame(
+      x,
+      y,
+      frame
+    );
+  }
+}
+
+// =====================================================
+// 鐵軌
+//
+// frame0：
+// (30,24)
+// (50,34)
+// (70,44)
+// (90,54)
+// =====================================================
+
+static void drawRails() {
+  drawGroundLine(
+    (float)RAIL_BASE_X,
+    (float)RAIL_BASE_Y,
+    RAIL_STEP_X,
+    RAIL_STEP_Y,
+    GROUND_RAIL
+  );
+}
+
+// =====================================================
+// 上月台
+//
+// frame0：
+// (48,0)
+// (78,15)
+// (108,30)
+// =====================================================
+
+static void drawUpperPlatform() {
+  drawTileLine(
+    (float)UPPER_BASE_X,
+    (float)UPPER_BASE_Y,
+    TILE_UPPER
+  );
+}
+
+// =====================================================
+// 下月台
+//
+// frame1：
+// (0,24)
+// (30,39)
+// (60,54)
+// =====================================================
+
+static void drawLowerPlatform() {
+  drawTileLine(
+    (float)LOWER_BASE_X,
+    (float)LOWER_BASE_Y,
+    TILE_LOWER
+  );
+}
+
+// =====================================================
+// 地板裝飾排列
+//
+// 2222 3333 2222 3333...
+// =====================================================
+
+static uint8_t groundDecorFrame(int k) {
+  int block = floorDiv(k, 4);
+
+  int parity = block % 2;
+
+  if (parity < 0) {
+    parity += 2;
+  }
+
+  parity =
+    (parity + metroGroundPatternOffset) & 1;
+
+  if (parity == 0) {
+    return GROUND_DECOR_2;
+  }
+
+  return GROUND_DECOR_3;
+}
+
+// =====================================================
+// 鐵軌右上側地板
+//
+// 第一排：GROUND frame1
+// 第二排：GROUND frame2 / frame3
+// 第三排：GROUND frame1，與第一排相同
+//
+// 每一排往右上移動：
+// X + 20
+// Y - 10
+// =====================================================
+
+static void drawUpperGround() {
+  float shiftX = sceneShiftX();
+  float shiftY = sceneShiftY();
+
+  // ===================================================
+  // 第一排地板
+  //
+  // 緊鄰鐵軌右上方。
+  // 使用 GROUND frame1。
+  // ===================================================
+
+  const float innerX =
+    (float)RAIL_BASE_X + 20.0f;
+
+  const float innerY =
+    (float)RAIL_BASE_Y - 10.0f;
+
+  int firstK1;
+  int lastK1;
+
+  visibleRepeatRange(
+    innerX,
+    RAIL_STEP_X,
+    GROUND_FRAME_W,
+    firstK1,
+    lastK1
+  );
+
+  for (int k = firstK1; k <= lastK1; k++) {
+    float x =
+      innerX +
+      (float)(k * RAIL_STEP_X) +
+      shiftX;
+
+    float y =
+      innerY +
+      (float)(k * RAIL_STEP_Y) +
+      shiftY;
+
+    drawGroundFrame(
+      x,
+      y,
+      GROUND_FLOOR
+    );
+  }
+
+  // ===================================================
+  // 第二排裝飾地板
+  //
+  // 從第一排再往右上移：
+  // X + 20
+  // Y - 10
+  //
+  // 使用 GROUND frame2 / frame3。
+  // 排列方式為 2222 3333。
+  // ===================================================
+
+  const float decorX =
+    innerX + 20.0f;
+
+  const float decorY =
+    innerY - 10.0f;
+
+  int firstK2;
+  int lastK2;
+
+  visibleRepeatRange(
+    decorX,
+    RAIL_STEP_X,
+    GROUND_FRAME_W,
+    firstK2,
+    lastK2
+  );
+
+  for (int k = firstK2; k <= lastK2; k++) {
+    float x =
+      decorX +
+      (float)(k * RAIL_STEP_X) +
+      shiftX;
+
+    float y =
+      decorY +
+      (float)(k * RAIL_STEP_Y) +
+      shiftY;
+
+    drawGroundFrame(
+      x,
+      y,
+      groundDecorFrame(k)
+    );
+  }
+
+  // ===================================================
+  // 第三排地板
+  //
+  // 從第二排再往右上移：
+  // X + 20
+  // Y - 10
+  //
+  // 圖資與第一排相同，
+  // 使用 GROUND frame1。
+  // ===================================================
+
+  const float thirdX =
+    decorX + 20.0f;
+
+  const float thirdY =
+    decorY - 10.0f;
+
+  int firstK3;
+  int lastK3;
+
+  visibleRepeatRange(
+    thirdX,
+    RAIL_STEP_X,
+    GROUND_FRAME_W,
+    firstK3,
+    lastK3
+  );
+
+  for (int k = firstK3; k <= lastK3; k++) {
+    float x =
+      thirdX +
+      (float)(k * RAIL_STEP_X) +
+      shiftX;
+
+    float y =
+      thirdY +
+      (float)(k * RAIL_STEP_Y) +
+      shiftY;
+
+    drawGroundFrame(
+      x,
+      y,
+      GROUND_FLOOR
+    );
+  }
+}
+
+// =====================================================
+// 鐵軌左下側地板
+//
+// 全部使用 GROUND frame1。
+// =====================================================
+
+static void drawLowerGround() {
+  drawGroundLine(
+    (float)(
+      LOWER_BASE_X +
+      FLOOR_OFFSET_X
+    ),
+    (float)(
+      LOWER_BASE_Y +
+      FLOOR_OFFSET_Y
+    ),
+    RAIL_STEP_X,
+    RAIL_STEP_Y,
+    GROUND_FLOOR
+  );
+}
+
+// =====================================================
+// 車站路線與站牌動畫
+// =====================================================
+
+static const uint8_t* getMetroRouteArray(
+  uint8_t route
+) {
+  switch (route) {
+    case METRO_ROUTE_WEST:
+      return metroRouteWest;
+
+    case METRO_ROUTE_EAST:
+      return metroRouteEast;
+
+    case METRO_ROUTE_SOUTH:
+      return metroRouteSouth;
+
+    case METRO_ROUTE_NORTH:
+      return metroRouteNorth;
+  }
+
+  return metroRouteEast;
+}
+
+static uint8_t getMetroRouteLength(
+  uint8_t route
+) {
+  switch (route) {
+    case METRO_ROUTE_WEST:
+      return sizeof(metroRouteWest) /
+             sizeof(metroRouteWest[0]);
+
+    case METRO_ROUTE_EAST:
+      return sizeof(metroRouteEast) /
+             sizeof(metroRouteEast[0]);
+
+    case METRO_ROUTE_SOUTH:
+      return sizeof(metroRouteSouth) /
+             sizeof(metroRouteSouth[0]);
+
+    case METRO_ROUTE_NORTH:
+      return sizeof(metroRouteNorth) /
+             sizeof(metroRouteNorth[0]);
+  }
+
+  return sizeof(metroRouteEast) /
+         sizeof(metroRouteEast[0]);
+}
+
+static void metroPickNewRoute() {
+  uint8_t newRoute;
+
+  do {
+    newRoute = (uint8_t)random(0, 4);
+  } while (newRoute == metroLastRoute);
+
+  metroCurrentRoute = newRoute;
+  metroLastRoute = newRoute;
+  metroRoutePos = 0;
+  metroRouteDir = 1;
+
+  const uint8_t* routeArray =
+    getMetroRouteArray(metroCurrentRoute);
+
+  metroCurrentStationIndex =
+    routeArray[metroRoutePos];
+}
+
+static void metroNextStation() {
+  const uint8_t* routeArray =
+    getMetroRouteArray(metroCurrentRoute);
+
+  uint8_t routeLength =
+    getMetroRouteLength(metroCurrentRoute);
+
+  metroRoutePos += metroRouteDir;
+
+  // 到達終點後，改為往美麗島方向返回。
+  if (metroRoutePos >= routeLength) {
+    metroRoutePos = routeLength - 2;
+    metroRouteDir = -1;
+  }
+
+  // 返回美麗島後，重新隨機選擇下一條路線。
+  if (metroRoutePos <= 0 && metroRouteDir < 0) {
+    metroPickNewRoute();
+    return;
+  }
+
+  metroCurrentStationIndex =
+    routeArray[metroRoutePos];
+}
+
+static int getMetroStationCenterX() {
+  const MetroStationDef& station =
+    metroStationList[metroCurrentStationIndex];
+
+  return
+    (METRO_SCR_W - station.w) / 2;
+}
+
+static bool shouldDrawStationBoard() {
+  return
+    metroState == METRO_STATION_IN ||
+    metroState == METRO_STATION_HOLD ||
+    metroState == METRO_STATION_OUT;
+}
+
+static void drawMetroStationBoard() {
+  if (!shouldDrawStationBoard()) {
+    return;
+  }
+
+  const MetroStationDef& station =
+    metroStationList[metroCurrentStationIndex];
+
+  drawIndexedSprite565(
+    metroStationX,
+    METRO_STATION_Y,
+    station.w,
+    station.h,
+    station.sprite,
+    station.palette
+  );
+}
+
+// =====================================================
+// 場景判斷
+// =====================================================
+
+static bool useGround() {
+  return metroState == METRO_GROUND_RUN;
+}
+
+static bool shouldDrawClock() {
+  return metroState == METRO_PLATFORM_WAIT;
+}
+
+// =====================================================
+// 完整場景繪製
+//
+// 順序：
+// 1. 鐵軌
+// 2. 上月台／右上地板
+// 3. 車廂
+// 4. 下月台／左下地板
+// 5. 時鐘文字
+// =====================================================
+
+static void renderMetroScene() {
+  display.fillScreen(
+    METRO_CLEAR_COLOR
+  );
+
+  unsigned long nowMs = millis();
+
+  unsigned long stateElapsed =
+    nowMs - metroStateStartMs;
+
+  // 地板剛開始出現
+  bool groundEntering =
+    metroState == METRO_GROUND_RUN &&
+    stateElapsed < SURFACE_TRANSITION_MS;
+
+  // 月台剛開始重新出現
+  bool platformEntering =
+    metroState == METRO_PLATFORM_DECEL &&
+    stateElapsed < SURFACE_TRANSITION_MS;
+
+  // 計算切換遮罩的位置。
+  // 64 -> 0，表示從畫面右邊逐漸移向左邊。
+  int transitionX = METRO_SCR_W;
+
+  if (groundEntering || platformEntering) {
+    float progress =
+      (float)stateElapsed /
+      (float)SURFACE_TRANSITION_MS;
+
+    float eased =
+      smoothStep(progress);
+
+    transitionX =
+      METRO_SCR_W -
+      roundToInt(
+        eased *
+        (float)METRO_SCR_W
+      );
+
+    if (transitionX < 0) {
+      transitionX = 0;
+    }
+
+    if (transitionX > METRO_SCR_W) {
+      transitionX = METRO_SCR_W;
+    }
+  }
+
+  // ===================================================
+  // 1. 鐵軌
+  // ===================================================
+
+  metroSurfaceClipEnabled = false;
+
+  drawRails();
+
+  // ===================================================
+  // 2. 上方月台／地板
+  // ===================================================
+
+  if (groundEntering) {
+    // 原本的月台先完整畫出。
+    metroSurfaceClipEnabled = false;
+
+    drawUpperPlatform();
+
+    // 新地板從右邊逐漸滑入。
+    metroSurfaceClipX = transitionX;
+    metroSurfaceClipEnabled = true;
+
+    drawUpperGround();
+  }
+  else if (platformEntering) {
+    // 原本的地板先完整畫出。
+    metroSurfaceClipEnabled = false;
+
+    drawUpperGround();
+
+    // 新月台從右邊逐漸滑入。
+    metroSurfaceClipX = transitionX;
+    metroSurfaceClipEnabled = true;
+
+    drawUpperPlatform();
+  }
+  else {
+    metroSurfaceClipEnabled = false;
+
+    if (useGround()) {
+      drawUpperGround();
+    } else {
+      drawUpperPlatform();
+    }
+  }
+
+  metroSurfaceClipEnabled = false;
+
+  // ===================================================
+  // 3. 車廂
+  // ===================================================
+
+  drawTrainFrame0(
+    metroTrainX,
+    metroTrainY
+  );
+
+  // ===================================================
+  // 4. 下方月台／地板
+  // ===================================================
+
+  if (groundEntering) {
+    // 原本的月台先完整畫出。
+    metroSurfaceClipEnabled = false;
+
+    drawLowerPlatform();
+
+    // 新地板從右邊逐漸滑入。
+    metroSurfaceClipX = transitionX;
+    metroSurfaceClipEnabled = true;
+
+    drawLowerGround();
+  }
+  else if (platformEntering) {
+    // 原本的地板先完整畫出。
+    metroSurfaceClipEnabled = false;
+
+    drawLowerGround();
+
+    // 新月台從右邊逐漸滑入。
+    metroSurfaceClipX = transitionX;
+    metroSurfaceClipEnabled = true;
+
+    drawLowerPlatform();
+  }
+  else {
+    metroSurfaceClipEnabled = false;
+
+    if (useGround()) {
+      drawLowerGround();
+    } else {
+      drawLowerPlatform();
+    }
+  }
+
+  metroSurfaceClipEnabled = false;
+
+  // ===================================================
+  // 5. 車站站牌
+  //
+  // 站牌使用索引圖＋RGB565 色盤，並繪製在場景最上層。
+  // ===================================================
+
+  drawMetroStationBoard();
+
+  // ===================================================
+  // 6. 時鐘文字
+  // ===================================================
+
+  if (shouldDrawClock()) {
+    drawThemeClockText();
+  }
+}
+
+// =====================================================
+// 狀態切換
+// =====================================================
+
+static void setState(
+  uint8_t nextState,
+  unsigned long nowMs
+) {
+  metroState = (MetroState)nextState;
+  metroStateStartMs = nowMs;
+  metroLastMotionMs = nowMs;
+
+  if (metroState == METRO_STATION_IN) {
+    metroStationX = METRO_SCR_W;
+    metroStationLastMoveMs = nowMs;
+  }
+
+  if (metroState == METRO_STATION_OUT) {
+    metroStationLastMoveMs = nowMs;
+  }
+}
+
+// =====================================================
+// 更新場景偏移
+// =====================================================
+
+static void updateScroll(
+  unsigned long nowMs,
+  float speedPps
+) {
+  unsigned long deltaMs =
+    nowMs - metroLastMotionMs;
+
+  metroLastMotionMs = nowMs;
+
+  // 避免系統偶爾停頓時場景突然跳太遠。
+  if (deltaMs > 200UL) {
+    deltaMs = 200UL;
+  }
+
+  metroScrollSpeedPps = speedPps;
+
+  metroScrollPx +=
+    speedPps *
+    ((float)deltaMs / 1000.0f);
+
+  while (metroScrollPx >= SCROLL_WRAP_PX) {
+    metroScrollPx -= SCROLL_WRAP_PX;
+  }
+
+  while (metroScrollPx < 0.0f) {
+    metroScrollPx += SCROLL_WRAP_PX;
+  }
+}
+
+// =====================================================
+// 動畫狀態更新
+// =====================================================
+
+static void updateMetroState(
+  unsigned long nowMs
+) {
+  unsigned long elapsed =
+    nowMs - metroStateStartMs;
+
+  switch (metroState) {
+    // -------------------------------------------------
+    // 初始畫面等待 3 秒
+    // -------------------------------------------------
+    case METRO_FIRST_WAIT: {
+      metroCameraX = CAMERA_HOME_X;
+
+      metroTrainX = TRAIN_START_X;
+      metroTrainY = TRAIN_START_Y;
+
+      metroScrollSpeedPps = 0.0f;
+
+      if (elapsed >= FIRST_WAIT_MS) {
+        setState(
+          METRO_TRAIN_IN,
+          nowMs
+        );
+      }
+
+      break;
+    }
+
+    // -------------------------------------------------
+    // 車廂逐幀由 (-36,-52) 移動至 (29,-19)
+    // -------------------------------------------------
+    case METRO_TRAIN_IN: {
+      float progress =
+        (float)elapsed /
+        (float)TRAIN_IN_MS;
+
+      float eased =
+        smoothStep(progress);
+
+      metroTrainX =
+        TRAIN_START_X +
+        (TRAIN_STOP_X - TRAIN_START_X) *
+        eased;
+
+      metroTrainY =
+        TRAIN_START_Y +
+        (TRAIN_STOP_Y - TRAIN_START_Y) *
+        eased;
+
+      if (elapsed >= TRAIN_IN_MS) {
+        metroTrainX = TRAIN_STOP_X;
+        metroTrainY = TRAIN_STOP_Y;
+
+        setState(
+          METRO_PLATFORM_WAIT,
+          nowMs
+        );
+      }
+
+      break;
+    }
+
+    // -------------------------------------------------
+    // 停靠 10 秒
+    // 後續開門與乘客動畫可放在這個階段
+    // -------------------------------------------------
+    case METRO_PLATFORM_WAIT: {
+      metroTrainX = TRAIN_STOP_X;
+      metroTrainY = TRAIN_STOP_Y;
+
+      metroScrollSpeedPps = 0.0f;
+
+      if (elapsed >= PLATFORM_WAIT_MS) {
+        setState(
+          METRO_CAMERA_TO_LEAVE,
+          nowMs
+        );
+      }
+
+      break;
+    }
+
+    // -------------------------------------------------
+    // CAM 由 (50,2) 平滑移到 (85,2)
+    // -------------------------------------------------
+    case METRO_CAMERA_TO_LEAVE: {
+      float progress =
+        (float)elapsed /
+        (float)CAMERA_MOVE_MS;
+
+      float eased =
+        smoothStep(progress);
+
+      metroCameraX =
+        CAMERA_HOME_X +
+        (CAMERA_LEAVE_X - CAMERA_HOME_X) *
+        eased;
+
+      if (elapsed >= CAMERA_MOVE_MS) {
+        metroCameraX = CAMERA_LEAVE_X;
+
+        setState(
+          METRO_WAIT_BEFORE_RUN,
+          nowMs
+        );
+      }
+
+      break;
+    }
+
+    // -------------------------------------------------
+    // CAM 到達 (85,2) 後等待 2 秒
+    // -------------------------------------------------
+    case METRO_WAIT_BEFORE_RUN: {
+      metroCameraX = CAMERA_LEAVE_X;
+      metroScrollSpeedPps = 0.0f;
+
+      if (elapsed >= BEFORE_RUN_WAIT_MS) {
+        setState(
+          METRO_PLATFORM_ACCEL,
+          nowMs
+        );
+      }
+
+      break;
+    }
+
+    // -------------------------------------------------
+    // 月台場景運行 8 秒，由慢到快
+    // -------------------------------------------------
+    case METRO_PLATFORM_ACCEL: {
+      float progress =
+        (float)elapsed /
+        (float)PLATFORM_ACCEL_MS;
+
+      float eased =
+        smoothStep(progress);
+
+      float speed =
+        SCROLL_START_PPS +
+        (
+          SCROLL_MAX_PPS -
+          SCROLL_START_PPS
+        ) *
+        eased;
+
+      updateScroll(
+        nowMs,
+        speed
+      );
+
+      if (elapsed >= PLATFORM_ACCEL_MS) {
+        setState(
+          METRO_STATION_IN,
+          nowMs
+        );
+      }
+
+      break;
+    }
+
+    // -------------------------------------------------
+    // 站牌由畫面右側滑入中央。
+    // 場景仍維持最高速度移動。
+    // -------------------------------------------------
+    case METRO_STATION_IN: {
+      updateScroll(
+        nowMs,
+        SCROLL_MAX_PPS
+      );
+
+      if (
+        nowMs - metroStationLastMoveMs >=
+        STATION_MOVE_INTERVAL_MS
+      ) {
+        metroStationLastMoveMs = nowMs;
+        metroStationX--;
+
+        int centerX =
+          getMetroStationCenterX();
+
+        if (metroStationX <= centerX) {
+          metroStationX = centerX;
+
+          setState(
+            METRO_STATION_HOLD,
+            nowMs
+          );
+        }
+      }
+
+      break;
+    }
+
+    // -------------------------------------------------
+    // 站牌停留在畫面中央。
+    // 場景仍維持最高速度移動。
+    // -------------------------------------------------
+    case METRO_STATION_HOLD: {
+      updateScroll(
+        nowMs,
+        SCROLL_MAX_PPS
+      );
+
+      if (elapsed >= STATION_HOLD_MS) {
+        setState(
+          METRO_STATION_OUT,
+          nowMs
+        );
+      }
+
+      break;
+    }
+
+    // -------------------------------------------------
+    // 站牌由中央繼續往左滑出畫面。
+    // 完全離開後才進入地板運行階段。
+    // -------------------------------------------------
+    case METRO_STATION_OUT: {
+      updateScroll(
+        nowMs,
+        SCROLL_MAX_PPS
+      );
+
+      if (
+        nowMs - metroStationLastMoveMs >=
+        STATION_MOVE_INTERVAL_MS
+      ) {
+        metroStationLastMoveMs = nowMs;
+        metroStationX--;
+
+        const MetroStationDef& station =
+          metroStationList[metroCurrentStationIndex];
+
+        if (metroStationX + station.w < 0) {
+          // 下一次循環改顯示路線中的下一站。
+          metroNextStation();
+
+          setState(
+            METRO_GROUND_RUN,
+            nowMs
+          );
+        }
+      }
+
+      break;
+    }
+
+    // -------------------------------------------------
+    // 地板取代月台，持續運行。
+    // -------------------------------------------------
+    case METRO_GROUND_RUN: {
+      updateScroll(
+        nowMs,
+        SCROLL_MAX_PPS
+      );
+
+      if (elapsed >= GROUND_RUN_MS) {
+        setState(
+          METRO_PLATFORM_DECEL,
+          nowMs
+        );
+      }
+
+      break;
+    }
+
+    // -------------------------------------------------
+    // 月台重新出現，5 秒內逐漸停止
+    // -------------------------------------------------
+    case METRO_PLATFORM_DECEL: {
+      float progress =
+        (float)elapsed /
+        (float)PLATFORM_DECEL_MS;
+
+      float eased =
+        smoothStep(progress);
+
+      float speed =
+        SCROLL_MAX_PPS *
+        (1.0f - eased);
+
+      updateScroll(
+        nowMs,
+        speed
+      );
+
+      if (elapsed >= PLATFORM_DECEL_MS) {
+        metroScrollSpeedPps = 0.0f;
+
+        setState(
+          METRO_STOP_WAIT,
+          nowMs
+        );
+      }
+
+      break;
+    }
+
+    // -------------------------------------------------
+    // 月台停止後等待 5 秒
+    // -------------------------------------------------
+    case METRO_STOP_WAIT: {
+      metroScrollSpeedPps = 0.0f;
+
+      if (elapsed >= STOP_WAIT_MS) {
+        setState(
+          METRO_CAMERA_HOME,
+          nowMs
+        );
+      }
+
+      break;
+    }
+
+    // -------------------------------------------------
+    // CAM 由 (85,2) 平滑移回 (50,2)
+    // 完成後回到第 2 步的 10 秒停靠
+    // -------------------------------------------------
+    case METRO_CAMERA_HOME: {
+      float progress =
+        (float)elapsed /
+        (float)CAMERA_MOVE_MS;
+
+      float eased =
+        smoothStep(progress);
+
+      metroCameraX =
+        CAMERA_LEAVE_X +
+        (CAMERA_HOME_X - CAMERA_LEAVE_X) *
+        eased;
+
+      if (elapsed >= CAMERA_MOVE_MS) {
+        metroCameraX = CAMERA_HOME_X;
+
+        // 不重新播放第一次進站，
+        // 直接回到 10 秒停靠。
+        setState(
+          METRO_PLATFORM_WAIT,
+          nowMs
+        );
+      }
+
+      break;
+    }
+
+    default: {
+      metroCameraX = CAMERA_HOME_X;
+
+      metroTrainX = TRAIN_STOP_X;
+      metroTrainY = TRAIN_STOP_Y;
+
+      metroScrollSpeedPps = 0.0f;
+
+      setState(
+        METRO_PLATFORM_WAIT,
+        nowMs
+      );
+
+      break;
+    }
+  }
+}
+
+// =====================================================
+// 初始化
+// =====================================================
+
+static void init() {
+  if (!ModefirstRun) {
+    return;
+  }
+
+  unsigned long nowMs = millis();
+
+  randomSeed(nowMs);
+
+  metroState = METRO_FIRST_WAIT;
+  metroStateStartMs = nowMs;
+  metroLastMotionMs = nowMs;
+
+  metroCameraX = CAMERA_HOME_X;
+
+  metroTrainX = TRAIN_START_X;
+  metroTrainY = TRAIN_START_Y;
+
+  metroScrollPx = 0.0f;
+  metroScrollSpeedPps = 0.0f;
+
+  metroGroundPatternOffset = 0;
+
+  // 從美麗島開始，並隨機選擇一條路線。
+  metroCurrentStationIndex =
+    METRO_CENTER_STATION_INDEX;
+
+  metroLastRoute = 255;
+  metroPickNewRoute();
+
+  metroStationX = METRO_SCR_W;
+  metroStationLastMoveMs = nowMs;
+
+  ModefirstRun = false;
+}
+
+// =====================================================
+// 主函式
+// =====================================================
+
+static void run() {
+  init();
+
+  unsigned long nowMs = millis();
+
+  updateMetroState(nowMs);
+  renderMetroScene();
+
+  wait_with_display(
+    FRAME_DELAY_MS 
+  );
+}
+
+}  // namespace Metro25D
+
+
+// =====================================================
+// 外層模式選擇
+// =====================================================
+
+static uint8_t chooseMetroActiveMode() {
+  switch (METRO_STARTUP_MODE) {
+    case METRO_STARTUP_2D:
+      return METRO_ACTIVE_2D;
+
+    case METRO_STARTUP_25D:
+      return METRO_ACTIVE_25D;
+
+    case METRO_STARTUP_RANDOM:
+    default:
+      return (random(0, 2) == 0)
+        ? METRO_ACTIVE_2D
+        : METRO_ACTIVE_25D;
+  }
+}
+
+// =====================================================
+// 統一初始化
+// =====================================================
+
+static void initSelectedMetroMode() {
+  // 沿用原本主程式的模式初始化旗標。
+  // 只在剛進入 MetroMode 時選擇一次模式。
+  if (!ModefirstRun) {
+    return;
+  }
+
+  randomSeed(millis());
+  metroActiveMode = chooseMetroActiveMode();
+
+  // 只初始化被選中的模式。
+  // 被選中的內部 Init 會把 ModefirstRun 設為 false。
+  switch (metroActiveMode) {
+    case METRO_ACTIVE_2D:
+      Metro2D::init();
+      break;
+
+    case METRO_ACTIVE_25D:
+    default:
+      Metro25D::init();
+      break;
+  }
+}
+
+// =====================================================
+// 統一主函式
+// =====================================================
+
+void MetroMode() {
+  initSelectedMetroMode();
+
+  // 初始化後不再重新判斷，持續執行同一個模式。
+  switch (metroActiveMode) {
+    case METRO_ACTIVE_2D:
+      Metro2D::run();
+      break;
+
+    case METRO_ACTIVE_25D:
+    default:
+      Metro25D::run();
+      break;
+  }
 }

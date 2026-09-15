@@ -36,6 +36,9 @@ extern uint8_t brightnessNow;
 extern int Mode;
 extern int hue, hueh, huem, hues, huew, hueb;
 
+extern uint8_t rgbOrder;
+void applyRGBOrder(uint8_t order);
+
 extern int randomMode;
 extern int lastRandomMode;
 extern bool ModefirstRun;
@@ -65,7 +68,7 @@ int GIF_R_name = 1 ;  //隨機GIF檔名參數
 int gifcount = 3 ;
 int random_gif_no = 10 ;
 int random_min = 30 ; //隨機模式的間隔時間
-int gifdelay = 150 ;
+int gifdelay = 50 ;
 
 
 
@@ -85,7 +88,7 @@ int customThemeSchedule[24] = {
 int lastCustomThemeHour = -1;
 
 //主題模式總數量
-#define THEME_MODE_MAX 24
+#define THEME_MODE_MAX 27
 
 
 
@@ -109,6 +112,9 @@ int lastCustomThemeHour = -1;
 #define EEPROM_GIF_NO       13     //隨機Gif 數量
 #define EEPROM_GIF_DELAY    14     //Gif 
 #define EEPROM_RANDOM_MIN   15     //隨機時鐘播放間隔時間
+#define EEPROM_RGB_ORDER    16   // HUB75 RGB 排序
+
+
 
 #define EEPROM_THEME_A 100  // 佔用 100, 101
 #define EEPROM_THEME_B 102  // 佔用 102, 103
@@ -202,8 +208,9 @@ void initDefaultEEPROMIfNeeded() {
 
     EEPROM.write(EEPROM_GIF_COUNT, 3);
     EEPROM.write(EEPROM_GIF_NO, 10);
-    EEPROM.write(EEPROM_GIF_DELAY, 150);
+    EEPROM.write(EEPROM_GIF_DELAY, 50);
     EEPROM.write(EEPROM_RANDOM_MIN, 30);
+    EEPROM.write(EEPROM_RGB_ORDER, 0); // 預設 RGB
 
     uint16_t defaultThemeA = 0xF800;
     uint16_t defaultThemeB = 0x0000;

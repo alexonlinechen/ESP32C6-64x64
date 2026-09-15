@@ -55,10 +55,12 @@ void SwitchMode() {
     case 21: DogMode(); break; 
     case 22: TrainMode(); break;  
     case 23: MarioTrainMode(); break;      
-    case 24: MetroMode(); break;     
-
+    case 24: MetroMode(); break; 
+    case 25: TaxiMode(); break;    
+    case 26: IslandMode(); break;  
+    case 27: ZooMode(); break;  
     
-    case 25:
+    case 28:
       ClockMode5(); // 隨機模式
       break;
 
@@ -334,8 +336,9 @@ void ClockMode5() {
     case 22: TrainMode(); break;  
     case 23: MarioTrainMode(); break;      
     case 24: MetroMode(); break;     
-
-
+    case 25: TaxiMode(); break;
+    case 26: IslandMode(); break;    
+    case 27: ZooMode(); break; 
   }
 
 if ( millis() - randomTime > random_min*60000){    //間隔 - 分鐘顯示時間

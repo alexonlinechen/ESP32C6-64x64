@@ -98,6 +98,7 @@ private:
 
   // Frame control
   int frameDelay;
+  bool frameDrawn;
   int transparentColorIndex;
   int prevBackgroundIndex;
   int prevDisposalMethod;
@@ -338,6 +339,7 @@ public:
     prevBackgroundIndex = 0;
     frameDelay = 0;
     keyFrame = true;
+    frameDrawn = false;
     rectX = rectY = rectWidth = rectHeight = 0;
     colorCount = 0;
 
@@ -351,6 +353,10 @@ public:
 
   int getFrameDelay() const {
     return frameDelay;
+  }
+
+  bool wasFrameDrawn() const {
+    return frameDrawn;
   }
 
   bool parseGifHeader() {
@@ -398,6 +404,7 @@ public:
   }
 
   int drawFrame() {
+    frameDrawn = false;
     int b = readByte();
     if (b == -1) return ERROR_FINISHED;
 
@@ -547,7 +554,7 @@ public:
 
     // 整幀畫完後再刷新
     flushToDisplayAndShow();
-
+    frameDrawn = true;
     return ERROR_NONE;
   }
 };

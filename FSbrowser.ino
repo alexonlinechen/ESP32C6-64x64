@@ -189,43 +189,115 @@ server.on("/fs", HTTP_GET, [](AsyncWebServerRequest *request){
         }
     });
 
-    // 3. PUT 處理 (創建檔案/重命名/移動)
-server.on("/edit", HTTP_PUT, [](AsyncWebServerRequest *request) {
-        if (request->hasArg("path")) {
-            String path = request->arg("path");
-            
-            // 邏輯判斷：如果路徑中有點 "." 視為建立檔案，否則視為資料夾
-            if (path.indexOf(".") > 0) {
-                // 1. 建立檔案前，先確保它的父目錄都存在
-                int lastSlash = path.lastIndexOf('/');
-                if (lastSlash > 0) {
-                    _createDirRecursive(path.substring(0, lastSlash));
-                }
-                
-                // 2. 嘗試建立檔案
-                File file = LittleFS.open(path, "w");
-                if (file) {
-                    file.close();
-                    request->send(200, "text/plain", "File Created");
-                } else {
-                    request->send(500, "text/plain", "File Creation Failed");
-                }
-            } 
-            else {
-                // 3. 建立資料夾 (使用遞迴確保父目錄自動補齊)
-                _createDirRecursive(path);
-                // 再次檢查是否真的建立成功
-                if (LittleFS.exists(path)) {
-                    request->send(200, "text/plain", "Directory Created");
-                } else {
-                    request->send(500, "text/plain", "Directory Creation Failed");
-                }
-            }
-        } else {
-            request->send(400, "text/plain", "Missing path argument");
+    // 3. PUT 處理 (建立檔案 / 建立資料夾 / 重新命名 / 移動)
+    server.on("/edit", HTTP_PUT, [](AsyncWebServerRequest *request) {
+
+        if (!request->hasArg("path")) {
+            return request->send(400, "text/plain", "Missing path argument");
         }
+
+        String action = request->hasArg("action") ? request->arg("action") : "create";
+        String path   = request->arg("path");
+
+        path.trim();
+        if (!path.startsWith("/")) path = "/" + path;
+
+        // -------------------------------------------------
+        // RENAME / MOVE
+        // fs.html 會傳：action=rename, path=舊路徑, dest=新路徑
+        // -------------------------------------------------
+        if (action == "rename") {
+
+            if (!request->hasArg("dest")) {
+                return request->send(400, "text/plain", "Missing dest argument");
+            }
+
+            String dest = request->arg("dest");
+            dest.trim();
+
+            if (!dest.startsWith("/")) dest = "/" + dest;
+
+            // 根目錄禁止重新命名
+            if (path == "/" || dest == "/") {
+                return request->send(400, "text/plain", "Cannot rename root directory");
+            }
+
+            if (path == dest) {
+                return request->send(400, "text/plain", "Source and destination are the same");
+            }
+
+            if (!LittleFS.exists(path)) {
+                return request->send(404, "text/plain", "Source not found: " + path);
+            }
+
+            // 避免意外覆蓋既有檔案
+            if (LittleFS.exists(dest)) {
+                return request->send(409, "text/plain", "Destination already exists: " + dest);
+            }
+
+            // 如果是移到其他資料夾，先確保目的地父目錄存在
+            int lastSlash = dest.lastIndexOf('/');
+            if (lastSlash > 0) {
+                _createDirRecursive(dest.substring(0, lastSlash));
+            }
+
+            Serial.printf("Rename: %s -> %s\n", path.c_str(), dest.c_str());
+
+            if (LittleFS.rename(path, dest)) {
+                // fs.html 的 onOperationComplete 會利用 responseText
+                // 更新來源資料夾，因此回傳舊檔案的父路徑
+                String oldParent = path.substring(0, path.lastIndexOf('/'));
+                if (oldParent.length() == 0) oldParent = "/";
+
+                return request->send(200, "text/plain", oldParent);
+            }
+
+            return request->send(500, "text/plain", "Rename Failed");
+        }
+
+        // -------------------------------------------------
+        // CREATE
+        // 沒有 action 或 action=create 時維持原本新增功能
+        // -------------------------------------------------
+
+        // 用結尾 / 判斷資料夾，比用「有沒有 .」更可靠
+        bool createDirectory = path.endsWith("/");
+
+        if (createDirectory) {
+            // 去掉尾端 /，LittleFS mkdir 使用標準目錄路徑
+            while (path.length() > 1 && path.endsWith("/")) {
+                path.remove(path.length() - 1);
+            }
+
+            _createDirRecursive(path);
+
+            if (LittleFS.exists(path)) {
+                return request->send(200, "text/plain", "Directory Created");
+            }
+
+            return request->send(500, "text/plain", "Directory Creation Failed");
+        }
+
+        // 建立檔案
+        int lastSlash = path.lastIndexOf('/');
+        if (lastSlash > 0) {
+            _createDirRecursive(path.substring(0, lastSlash));
+        }
+
+        // 不要用 w 去碰已存在的檔案，避免誤清成 0 KB
+        if (LittleFS.exists(path)) {
+            return request->send(409, "text/plain", "File already exists: " + path);
+        }
+
+        File file = LittleFS.open(path, "w");
+        if (!file) {
+            return request->send(500, "text/plain", "File Creation Failed");
+        }
+
+        file.close();
+        return request->send(200, "text/plain", "File Created");
     });
-    
+
     // 【新增】E. 檔案下載路由 (/download?path=...)
 // 【修正後的檔案下載路由】E. 檔案下載路由 (/download?path=...)
 server.on("/download", HTTP_GET, [](AsyncWebServerRequest *request){

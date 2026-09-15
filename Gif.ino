@@ -57,14 +57,26 @@ void playGif() {
         break;
       }
 
-      frameCount++;
+// drawFrame() 有些時候只是解析 GIF metadata，並沒有真正畫圖
+if (!gifPlayer.wasFrameDrawn()) {
+  continue;
+}
 
-      int frameDelay = gifdelay * 10;  // GIF 單位 1/100 秒 -> ms
-      if (frameDelay <= 0) {
-        frameDelay = gifdelay;
-      }
+frameCount++;
 
-      wait_with_display(frameDelay);
+// WEB 的 gifdelay 直接就是毫秒
+int frameDelay = gifdelay;
+
+// 防止設定異常
+if (frameDelay < 10) {
+  frameDelay = 10;
+}
+
+if (frameDelay > 200) {
+  frameDelay = 200;
+}
+
+wait_with_display(frameDelay);
 
       if (frameCount > 1000) {
         Serial.println("Safety break: too many frames");

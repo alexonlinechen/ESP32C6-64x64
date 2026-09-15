@@ -1,6 +1,8 @@
 
 
 
+
+
 // 'Mario', 126x28px
 const uint16_t MARIO_MAIN_PALETTE[] PROGMEM = {
   0x001F, 0x07FF, 0x5000, 0xF9A6, 0xFFDF, 0x8AC3, 0x9800, 0x0000,

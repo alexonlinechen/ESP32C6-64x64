@@ -28,6 +28,62 @@ server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
 });
 
 
+
+// =====================================================
+// HUB75 RGB 排序設定
+// 0=RGB
+// 1=RBG
+// 2=GRB
+// 3=GBR
+// 4=BRG
+// 5=BGR
+// =====================================================
+server.on("/setRgbOrder", HTTP_POST, [](AsyncWebServerRequest *request) {
+
+    String value = request->arg("value");
+
+    if (value.length() == 0) {
+        request->send(
+          400,
+          "application/json",
+          "{\"ok\":false,\"message\":\"Missing value\"}"
+        );
+        return;
+    }
+
+    int order = value.toInt();
+
+    if (order < 0 || order > 5) {
+        request->send(
+          400,
+          "application/json",
+          "{\"ok\":false,\"message\":\"Invalid RGB order\"}"
+        );
+        return;
+    }
+
+    rgbOrder = (uint8_t)order;
+
+    // 立即套用，不需要重開機
+    applyRGBOrder(rgbOrder);
+
+    // 儲存 EEPROM
+    EEPROM.write(EEPROM_RGB_ORDER, rgbOrder);
+    EEPROM.commit();
+
+    Serial.print(F("RGB Order changed to: "));
+    Serial.println(rgbOrder);
+
+    String json = "{";
+    json += "\"ok\":true,";
+    json += "\"rgbOrder\":" + String(rgbOrder);
+    json += "}";
+
+    request->send(200, "application/json", json);
+});
+
+
+
     // 1. 檔案系統更新頁面 (注意參數)
 // 💡 【全新補上】：對接網頁 Update 按鈕的 POST 路由，把傳進來的檔案存入 LittleFS
     server.on("/update", HTTP_POST, 
@@ -264,10 +320,38 @@ server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
     });
 
 
+    server.on("/Taxiclock", HTTP_POST, [](AsyncWebServerRequest *request) {  
+    display.clearDisplay();  
+    customThemeEnable = false; 
+    ModefirstRun = true;  
+    taxiModeReady = false;
+    Mode = 25;
+    Serial.println(F("計程車 模式")); 
+    });
+
+    server.on("/Islandclock", HTTP_POST, [](AsyncWebServerRequest *request) {  
+    display.clearDisplay();  
+    customThemeEnable = false; 
+    ModefirstRun = true;  
+    islandModeReady = false;
+    Mode = 26;
+    Serial.println(F("海島度假 模式")); 
+    });
+
+
+    server.on("/Zooclock", HTTP_POST, [](AsyncWebServerRequest *request) {  
+    display.clearDisplay();  
+    customThemeEnable = false; 
+    ModefirstRun = true;    
+    Mode = 27;
+    Serial.println(F("動物園 模式")); 
+    });
+
+
     server.on("/randommode", HTTP_POST, [](AsyncWebServerRequest *request) {   
     display.clearDisplay();  
     customThemeEnable = false;
-    Mode = 25; 
+    Mode = 28; 
     randomMode = random(1, THEME_MODE_MAX + 1);
     Serial.println(F("隨機模式")); 
     }); 
@@ -300,7 +384,7 @@ server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
 
 
                     // 主題數量24
-                    if ((modeValue >= 1 && modeValue <= 24) || modeValue == 99) {
+                    if ((modeValue >= 1 && modeValue <= THEME_MODE_MAX) || modeValue == 99) {
                         customThemeSchedule[hourIndex] = modeValue;
                     } else {
                         customThemeSchedule[hourIndex] = 99;
@@ -369,6 +453,7 @@ Serial.println(F("自訂主題時間表已儲存 EEPROM"));
          EEPROM.write(EEPROM_GIF_COUNT, gifcount);
          EEPROM.write(EEPROM_GIF_DELAY, gifdelay);
          EEPROM.write(EEPROM_RANDOM_MIN, random_min);
+         EEPROM.write(EEPROM_RGB_ORDER, rgbOrder);
 
          
          EEPROM.put(EEPROM_THEME_A, colorA_565); 
@@ -471,11 +556,13 @@ Serial.println(F("自訂主題時間表已儲存 EEPROM"));
                         break;
                            
                     case 'y':
-                        gifdelay = hh;
+                        gifdelay = constrain(hh, 10, 200);
                         Serial.print(F("gif延遲時間: "));
-                        Serial.println(gifdelay);                        
-                        break;                             
-                                                                                      
+                        Serial.println(gifdelay); 
+                        Serial.println(F(" ms"));                       
+                        break;
+
+                                                                                                                                        
                     default:
                         break;
                     }
@@ -582,7 +669,8 @@ server.on("/datasync", HTTP_POST, [](AsyncWebServerRequest *request) {
   json += "\"huem\":" + String(huem) + ",";
   json += "\"hues\":" + String(hues) + ",";
   json += "\"huew\":" + String(huew) + ",";
-  json += "\"hueb\":" + String(hueb);
+  json += "\"hueb\":" + String(hueb) + ",";
+  json += "\"rgbOrder\":" + String(rgbOrder);
   json += "}";
 
   request->send(200, "application/json", json);

@@ -360,8 +360,8 @@ static const FarmWorkPoint FARM_WORK_POINTS[] = {
 
   {250, 28},   // 狗窩
 
-  {240, 225},  // 池塘
-  {320, 368}   // EXIT
+  {240, 225}  // 池塘
+  
 };
 
 static const int FARM_WORK_POINT_COUNT =

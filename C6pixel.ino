@@ -5,14 +5,14 @@
 
 
 // --- XIAO ESP32-C6 引腳定義 ---
-#define P_LAT 21
+#define P_LAT 20
 #define P_OE  14
 #define P_A   7
 #define P_B   19
 #define P_C   18
 #define P_D   15
 #define P_E   6
-#define P_CLK 22
+#define P_CLK 21
 #define R1 0
 #define G1 2
 #define B1 1
@@ -23,6 +23,84 @@
 // 初始化顯示器
 PxMATRIX display(64, 64, P_LAT, P_OE, P_A, P_B, P_C, P_D, P_E);
 
+
+void applyRGBOrder(uint8_t order) {
+
+  switch (order) {
+
+    case 0: // RGB
+      display.setRGBPins(
+        R1, G1, B1,
+        R2, G2, B2,
+        P_CLK
+      );
+      break;
+
+    case 1: // RBG
+      display.setRGBPins(
+        R1, B1, G1,
+        R2, B2, G2,
+        P_CLK
+      );
+      break;
+
+    case 2: // GRB
+      display.setRGBPins(
+        G1, R1, B1,
+        G2, R2, B2,
+        P_CLK
+      );
+      break;
+
+    case 3: // GBR
+      display.setRGBPins(
+        G1, B1, R1,
+        G2, B2, R2,
+        P_CLK
+      );
+      break;
+
+    case 4: // BRG
+      display.setRGBPins(
+        B1, R1, G1,
+        B2, R2, G2,
+        P_CLK
+      );
+      break;
+
+    case 5: // BGR
+      display.setRGBPins(
+        B1, G1, R1,
+        B2, G2, R2,
+        P_CLK
+      );
+      break;
+
+    default:
+      // 不合法就回 RGB
+      rgbOrder = 0;
+
+      display.setRGBPins(
+        R1, G1, B1,
+        R2, G2, B2,
+        P_CLK
+      );
+      break;
+  }
+
+  Serial.print(F("Panel RGB Order = "));
+
+  switch (rgbOrder) {
+    case 0: Serial.println(F("RGB")); break;
+    case 1: Serial.println(F("RBG")); break;
+    case 2: Serial.println(F("GRB")); break;
+    case 3: Serial.println(F("GBR")); break;
+    case 4: Serial.println(F("BRG")); break;
+    case 5: Serial.println(F("BGR")); break;
+  }
+}
+
+
 // 全域實體
 AsyncWebServer server(80);
 
@@ -32,6 +110,7 @@ GifPlayer gifPlayer;
 
 String setssid, setpwd, input, readssid;
 uint8_t brightnessNow = 10;
+uint8_t rgbOrder = 0;
 int Mode = 1;
 int hue = 180, hueh = 180, huem = 180, hues = 180, huew = 180, hueb = 180;
 int randomMode = 1, lastRandomMode = -1;
@@ -80,14 +159,32 @@ if (!LittleFS.begin(true)) {
 }
   
   
-  // 顯示器硬體初始化
-  display.setRGBPins(R1, G1, B1, R2, G2, B2, P_CLK);
-  display.begin();
-  display.clearDisplay();
+// EEPROM 初始化
+EEPROM.begin(EEPROM_SIZE);
+initDefaultEEPROMIfNeeded();
 
-  // EEPROM 初始化
-  EEPROM.begin(EEPROM_SIZE);
-  initDefaultEEPROMIfNeeded();
+
+// ================================
+// 讀取 HUB75 RGB 排序
+// ================================
+rgbOrder = EEPROM.read(EEPROM_RGB_ORDER);
+
+// 舊機器 EEPROM 16 可能是 255
+if (rgbOrder > 5) {
+  rgbOrder = 0;
+
+  EEPROM.write(EEPROM_RGB_ORDER, rgbOrder);
+  EEPROM.commit();
+}
+
+
+// ================================
+// 顯示器硬體初始化
+// ================================
+applyRGBOrder(rgbOrder);
+
+display.begin();
+display.clearDisplay();
   
     brightnessNow = EEPROM.read(EEPROM_BRIGHTNESS);
     Mode = EEPROM.read(EEPROM_MODE);
