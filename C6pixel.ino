@@ -137,6 +137,13 @@ void FS_Init();
 void handleFileUpload(AsyncWebServerRequest *request, String filename, size_t index, uint8_t *data, size_t len, bool final);
 void handleFSUpdatePage(AsyncWebServerRequest *request);
 
+#if FEATURE_HOME_TRASH
+void homeTrashSetup();
+void homeTrashUpdate();
+bool homeTrashActive();
+void homeTrashDraw();
+#endif
+
 // 非阻塞等待函數：在等待時持續刷新螢幕，消除閃爍  更新時間
 void wait_with_display(int ms) { 
     unsigned long start = millis();
@@ -247,6 +254,11 @@ display.clearDisplay();
    launchWeb();
     // 檔案系統初始化 (需配合修改後的 FSbrowser.ino)
    FS_Init();
+
+#if FEATURE_HOME_TRASH
+   // HomeTrash 自己註冊 /trash 與 /api/hometrash/*，不污染原本 Web.ino。
+   homeTrashSetup();
+#endif
    
    server.begin();
    Serial.println("HTTP server started");
@@ -261,11 +273,23 @@ display.clearDisplay();
 void loop() {
   display.display();
 
-  TimeONOFF();    
-  SwitchMode();
-  
-  display.display();
+  // 先更新本地時間，再判斷所有時間型功能。
   updateLocalTime();
+  TimeONOFF();
+
+#if FEATURE_HOME_TRASH
+  // HomeTrash 是暫時 Display Override，不改 Mode。
+  homeTrashUpdate();
+  if (homeTrashActive()) {
+    homeTrashDraw();
+  } else {
+    SwitchMode();
+  }
+#else
+  SwitchMode();
+#endif
+
+  display.display();
 }
 
 

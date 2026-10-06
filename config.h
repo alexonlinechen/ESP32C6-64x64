@@ -14,6 +14,15 @@
 #define matrix_width 64
 #define matrix_height 64
 
+// ============================================================
+// Optional module: HomeTrash (住家垃圾車資訊)
+// 1 = 編譯啟用；0 = 完全不呼叫此模組。
+// 若之後要做通用版，可改成 0，並移除 HomeTrash.ino / HomeTrashData.h / data/trash*。
+// ============================================================
+#ifndef FEATURE_HOME_TRASH
+#define FEATURE_HOME_TRASH 1
+#endif
+
 
 // 外部宣告 (避免重複定義)
 extern AsyncWebServer server;

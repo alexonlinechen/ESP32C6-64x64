@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#0b1020">
+<title>HomeTrash 垃圾車設定</title>
+<style>
+:root{--bg:#0b1020;--card:#141d32;--card2:#0c1425;--line:#263454;--text:#f5f7fb;--muted:#94a3b8;--blue:#2563eb;--green:#059669;--orange:#b45309;--red:#be123c}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans TC",Arial,sans-serif}.app{max-width:720px;margin:auto;padding:20px 16px 60px}.head{display:flex;align-items:center;gap:12px;margin-bottom:18px}.head h1{font-size:22px;margin:0}.head p{margin:4px 0 0;color:var(--muted);font-size:13px}.spacer{flex:1}.back{color:#bfdbfe;text-decoration:none;border:1px solid var(--line);padding:9px 12px;border-radius:11px}.card{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:16px;margin:12px 0}.card h2{font-size:16px;margin:0 0 5px}.hint{font-size:12px;color:var(--muted);line-height:1.6;margin:0 0 12px}.field{margin:13px 0}.field label{display:block;font-size:13px;font-weight:700;margin-bottom:7px}.row{display:grid;grid-template-columns:1fr 1fr;gap:10px}.toggle{display:flex;align-items:center;gap:10px;padding:10px 0}.toggle input{width:20px;height:20px}input[type=text],input[type=url],input[type=number],input[type=time]{width:100%;min-height:44px;border:1px solid var(--line);background:var(--card2);color:var(--text);border-radius:11px;padding:10px 12px;font:inherit}.btns{display:flex;gap:9px;flex-wrap:wrap}.btn{border:0;border-radius:11px;padding:11px 14px;color:white;font-weight:800;background:var(--blue);cursor:pointer}.btn.green{background:var(--green)}.btn.orange{background:var(--orange)}.status{display:grid;grid-template-columns:140px 1fr;gap:8px 12px;font-size:13px}.key{color:var(--muted)}.val{word-break:break-all}.badge{display:inline-block;padding:3px 8px;border-radius:99px;background:#24324d}.ok{color:#6ee7b7}.bad{color:#fda4af}.note{padding:10px 12px;border-left:3px solid #f59e0b;background:#f59e0b10;color:#fde68a;font-size:12px;line-height:1.6;border-radius:8px}.toast{position:fixed;left:50%;bottom:22px;transform:translateX(-50%);background:#111827;border:1px solid var(--line);padding:10px 15px;border-radius:12px;opacity:0;pointer-events:none;transition:.2s}.toast.show{opacity:1}
+@media(max-width:520px){.row{grid-template-columns:1fr}.status{grid-template-columns:110px 1fr}}
+</style>
+</head>
+<body>
+<div class="app">
+  <div class="head">
+    <div><h1>🚛 HomeTrash</h1><p>住家專用垃圾車顯示模組</p></div><div class="spacer"></div><a class="back" href="/">回首頁</a>
+  </div>
+
+  <div class="card">
+    <h2>功能開關</h2>
+    <p class="hint">正式模式只在設定時間內暫時覆蓋目前主模式；結束後自動回原模式。</p>
+    <label class="toggle"><input id="enabled" type="checkbox"> 啟用垃圾車資訊</label>
+    <label class="toggle"><input id="testMode" type="checkbox"> 強制測試模式（忽略星期與時間，立即佔用畫面）</label>
+    <label class="toggle"><input id="skipWednesday" type="checkbox"> 星期三不顯示</label>
+  </div>
+
+  <div class="card">
+    <h2>排程</h2>
+    <div class="row">
+      <div class="field"><label>開始時間</label><input id="startTime" type="time" value="18:25"></div>
+      <div class="field"><label>結束時間</label><input id="endTime" type="time" value="19:00"></div>
+    </div>
+    <div class="field"><label>API 更新間隔（秒）</label><input id="updateSeconds" type="number" min="5" max="300" value="20"></div>
+  </div>
+
+  <div class="card">
+    <h2>資料來源</h2>
+    <div class="field"><label>垃圾車車號</label><input id="carId" type="text" value="KEM-0621"></div>
+    <label class="toggle"><input id="useTestApi" type="checkbox"> 使用測試 JSON URL</label>
+    <div class="field"><label>測試 JSON URL</label><input id="testUrl" type="url" placeholder="https://你的伺服器/trash_test.json"></div>
+    <div class="note">建議假 JSON 也使用正式市府格式：<br>{ "data": [ { "car": "KEM-0621", "location": "高雄市大寮區 高61 成功路" } ] }</div>
+    <p class="hint" style="margin-top:12px">取消「使用測試 JSON URL」後，MCU 會直接抓高雄市政府垃圾車 API。</p>
+  </div>
+
+  <div class="card">
+    <div class="btns">
+      <button class="btn green" onclick="saveSettings()">儲存設定</button>
+      <button class="btn orange" onclick="fetchNow()">立即抓取一次</button>
+      <button class="btn" onclick="loadAll()">重新讀取</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>目前狀態</h2>
+    <p class="hint">每 2 秒更新。API 失敗時會保留最後一次成功位置。</p>
+    <div class="status">
+      <div class="key">畫面 Override</div><div class="val" id="stActive">—</div>
+      <div class="key">抓取中</div><div class="val" id="stFetching">—</div>
+      <div class="key">資料來源</div><div class="val" id="stSource">—</div>
+      <div class="key">HTTP</div><div class="val" id="stHttp">—</div>
+      <div class="key">API 位置</div><div class="val" id="stLocation">—</div>
+      <div class="key">顯示名稱</div><div class="val" id="stLabel">—</div>
+      <div class="key">點陣</div><div class="val" id="stBitmap">—</div>
+      <div class="key">最後成功</div><div class="val" id="stAgo">—</div>
+      <div class="key">訊息</div><div class="val" id="stError">—</div>
+    </div>
+  </div>
+</div>
+<div class="toast" id="toast"></div>
+<script>
+const $=id=>document.getElementById(id);
+function toast(s){const t=$('toast');t.textContent=s;t.classList.add('show');clearTimeout(t._x);t._x=setTimeout(()=>t.classList.remove('show'),1800)}
+function splitTime(v){const p=(v||'00:00').split(':');return [Number(p[0]||0),Number(p[1]||0)]}
+function fmt2(v){return String(v).padStart(2,'0')}
+function form(obj){return Object.entries(obj).map(([k,v])=>encodeURIComponent(k)+'='+encodeURIComponent(v)).join('&')}
+async function loadSettings(){
+  const r=await fetch('/api/hometrash/settings',{cache:'no-store'}); if(!r.ok) throw new Error('settings HTTP '+r.status); const x=await r.json();
+  $('enabled').checked=!!x.enabled;$('testMode').checked=!!x.testMode;$('useTestApi').checked=!!x.useTestApi;$('skipWednesday').checked=!!x.skipWednesday;
+  $('startTime').value=fmt2(x.startHour)+':'+fmt2(x.startMinute);$('endTime').value=fmt2(x.endHour)+':'+fmt2(x.endMinute);
+  $('updateSeconds').value=x.updateSeconds;$('carId').value=x.carId||'';$('testUrl').value=x.testUrl||'';
+}
+async function saveSettings(){
+  const [sh,sm]=splitTime($('startTime').value),[eh,em]=splitTime($('endTime').value);
+  const data={enabled:$('enabled').checked?1:0,testMode:$('testMode').checked?1:0,useTestApi:$('useTestApi').checked?1:0,skipWednesday:$('skipWednesday').checked?1:0,startHour:sh,startMinute:sm,endHour:eh,endMinute:em,updateSeconds:$('updateSeconds').value,carId:$('carId').value,testUrl:$('testUrl').value};
+  const r=await fetch('/api/hometrash/settings',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded;charset=UTF-8'},body:form(data)});if(!r.ok)throw new Error('save HTTP '+r.status);toast('已儲存，並排入一次抓取');setTimeout(loadStatus,500)
+}
+async function fetchNow(){const r=await fetch('/api/hometrash/fetch',{method:'POST'});if(!r.ok)throw new Error('fetch HTTP '+r.status);toast('已排入立即抓取');setTimeout(loadStatus,400)}
+async function loadStatus(){
+ try{const r=await fetch('/api/hometrash/status',{cache:'no-store'});if(!r.ok)throw new Error();const x=await r.json();
+ $('stActive').innerHTML=x.active?'<span class="ok">啟用中</span>':'未啟用';$('stFetching').textContent=x.fetching?'是':'否';$('stSource').textContent=x.source==='test'?'測試 URL':'高雄市 API';$('stHttp').textContent=x.httpCode||'—';$('stLocation').textContent=x.location||'—';$('stLabel').textContent=x.displayLabel||'—';$('stBitmap').innerHTML=x.bitmapReady?'<span class="ok">OK</span>':'<span class="bad">未載入</span>';$('stAgo').textContent=x.lastSuccessAgo?x.lastSuccessAgo+' 秒前':'—';$('stError').textContent=x.lastError||'正常';
+ }catch(e){$('stError').textContent='無法讀取 MCU 狀態'}
+}
+async function loadAll(){try{await loadSettings();await loadStatus();toast('已重新讀取')}catch(e){toast('讀取失敗')}}
+window.addEventListener('load',()=>{loadAll();setInterval(loadStatus,2000)})
+</script>
+</body>
+</html>
