@@ -5,14 +5,14 @@
 
 
 // --- XIAO ESP32-C6 引腳定義 ---
-#define P_LAT 20
+#define P_LAT 21
 #define P_OE  14
 #define P_A   7
 #define P_B   19
 #define P_C   18
 #define P_D   15
 #define P_E   6
-#define P_CLK 21
+#define P_CLK 22
 #define R1 0
 #define G1 2
 #define B1 1

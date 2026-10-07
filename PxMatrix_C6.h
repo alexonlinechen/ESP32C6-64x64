@@ -1,29 +1,29 @@
 /*********************************************************************
-  PxMatrix_C6 V3.2 FINAL - DIRECT2 + double buffer + paced cooperative refresh
+  PxMatrix_C6 PARLIO BETA1 - ESP32-C6 HUB75 64x64 hardware-assisted refresh
 
-  Design goals:
-  - Keep the normal Adafruit_GFX/PxMatrix drawing API.
-  - Refresh always reads a stable FRONT packed bitplane buffer.
-  - Drawing always writes a BACK packed bitplane buffer.
-  - drawPixel()/fillRect() automatically inject short refresh bursts so
-    a heavy renderer does not leave HUB75 dark for several milliseconds.
-  - The next public display() call commits the completed BACK frame at a
-    complete 96-slice PWM-cycle boundary, avoiding half-rendered frames.
-  - After swap, FRONT is copied to BACK so partial-update themes preserve
-    the same semantics as the original single framebuffer.
+  Purpose:
+  - Preserve the existing Adafruit_GFX / PxMATRIX drawing API used by C6pixel.
+  - Keep FRONT/BACK packed 3-bit RGB frame buffers.
+  - Move HUB75 scan timing away from Arduino loop() and CPU GPIO bit-banging.
+  - PARLIO + GDMA continuously sends a complete HUB75 waveform.
+  - A high-priority producer task keeps the PARLIO transaction queue filled.
+  - Two DMA waveform buffers are used. A waveform is never modified until all
+    transactions that referenced it have completed.
 
-  V3.2 pacing policy:
-    target refresh is paced to a fixed full-cycle rate (default 160 Hz)
-    drawing checks the slice deadline frequently and services at most one
-    due slice at a time. This avoids alternating between ~240 Hz idle scan
-    and a much slower scan while rendering, which can create low-amplitude
-    frame-rate brightness wobble.
+  ESP32-C6 / 64x64 / 1:32 scan only.
 
-  Buffer RAM:
-    front: 3 * 32 * 64 = 6144 bytes
-    back : 3 * 32 * 64 = 6144 bytes
-    total                   12288 bytes
-  This matches the original RGB888 single-buffer RAM size.
+  BETA1 timing (same timing proven by C6_Driver_Benchmark_PARLIO_B):
+    PARLIO clock:      4 MHz
+    scan slot:         260 clocks = 65 us
+    slices/frame:      32 rows * 3 PWM planes = 96
+    full refresh:      ~160.26 Hz
+    waveform buffer:   49,920 bytes
+    double waveform:   99,840 bytes
+
+  Notes:
+  - display() now means "commit BACK frame". It no longer performs scanning.
+  - wait_with_display()/yield()/Wi-Fi can run normally; refresh is independent.
+  - Legacy cooperative-refresh tuning methods remain as compatibility no-ops.
 *********************************************************************/
 
 #ifndef _PxMATRIX_H
@@ -32,15 +32,34 @@
 #include <Arduino.h>
 #include <Adafruit_GFX.h>
 #include <string.h>
-#include "soc/gpio_reg.h"
-#include "soc/soc.h"
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/semphr.h"
+#include "esp_err.h"
+#include "esp_heap_caps.h"
+#include "esp_idf_version.h"
+#include "soc/soc_caps.h"
+#include "driver/parlio_tx.h"
+
+#if !defined(CONFIG_IDF_TARGET_ESP32C6)
+#error "PxMatrix_C6 PARLIO backend is intended for ESP32-C6 only."
+#endif
+
+#ifndef SOC_PARLIO_TX_UNIT_MAX_DATA_WIDTH
+#error "PARLIO TX is not available in this ESP-IDF/Arduino core."
+#endif
+
+#if SOC_PARLIO_TX_UNIT_MAX_DATA_WIDTH < 16
+#error "PxMatrix_C6 PARLIO backend requires 16-bit PARLIO TX support."
+#endif
 
 #ifndef PxMATRIX_COLOR_DEPTH
 #define PxMATRIX_COLOR_DEPTH 3
 #endif
 
 #if PxMATRIX_COLOR_DEPTH != 3
-#error "This PxMatrix_C6.h is designed for PxMATRIX_COLOR_DEPTH == 3"
+#error "PxMatrix_C6 PARLIO backend requires PxMATRIX_COLOR_DEPTH == 3"
 #endif
 
 class PxMATRIX : public Adafruit_GFX {
@@ -48,140 +67,146 @@ public:
   PxMATRIX(uint16_t width, uint16_t height,
            uint8_t LATCH, uint8_t OE,
            uint8_t A, uint8_t B, uint8_t C, uint8_t D, uint8_t E)
-    : Adafruit_GFX(width, height) {
-    _LATCH_PIN = LATCH;
-    _OE_PIN    = OE;
-    _A_PIN     = A;
-    _B_PIN     = B;
-    _C_PIN     = C;
-    _D_PIN     = D;
-    _E_PIN     = E;
-    _width     = width;
-    _height    = height;
-  }
+    : Adafruit_GFX(width, height),
+      _width(width), _height(height),
+      _LATCH_PIN(LATCH), _OE_PIN(OE),
+      _A_PIN(A), _B_PIN(B), _C_PIN(C), _D_PIN(D), _E_PIN(E) {}
 
   ~PxMATRIX() {
-    freeBuffers();
+    stopParlio();
+    freeFrameBuffers();
   }
 
+  // The first call (before begin) defines the six physical PARLIO color slots.
+  // Later calls may permute the same six pins (C6pixel RGB-order setting). In
+  // that case only logical bit mapping changes; PARLIO does not need restart.
   void setRGBPins(uint8_t r1, uint8_t g1, uint8_t b1,
                   uint8_t r2, uint8_t g2, uint8_t b2,
                   uint8_t clk) {
-    noInterrupts();
+    if (!_started) {
+      _R1 = r1; _G1 = g1; _B1 = b1;
+      _R2 = r2; _G2 = g2; _B2 = b2;
+      _CLK_PIN = clk;
+      return;
+    }
+
+    if (clk != _CLK_PIN) {
+      Serial.println(F("PARLIO: runtime CLK pin change is not supported; restart required."));
+      return;
+    }
+
+    if (_frameMutex) xSemaphoreTake(_frameMutex, portMAX_DELAY);
 
     _R1 = r1; _G1 = g1; _B1 = b1;
     _R2 = r2; _G2 = g2; _B2 = b2;
-    _CLK_PIN = clk;
 
-    _R1_MASK = bitMask(r1);
-    _G1_MASK = bitMask(g1);
-    _B1_MASK = bitMask(b1);
-    _R2_MASK = bitMask(r2);
-    _G2_MASK = bitMask(g2);
-    _B2_MASK = bitMask(b2);
-    _CLK_MASK = bitMask(clk);
+    bool ok = rebuildLogicalColorMasks();
+    if (ok) requestWaveUpdateLocked();
 
-    _RGB_MASK_ALL =
-      _R1_MASK | _G1_MASK | _B1_MASK |
-      _R2_MASK | _G2_MASK | _B2_MASK;
-    _RGB_CLK_MASK = _RGB_MASK_ALL | _CLK_MASK;
+    if (_frameMutex) xSemaphoreGive(_frameMutex);
 
-    rebuildGpioLUT();
-    interrupts();
+    if (!ok) {
+      Serial.println(F("PARLIO: RGB-order change used pins outside initial color-pin set; ignored."));
+    }
   }
 
   void begin() {
-    pinMode(_LATCH_PIN, OUTPUT);
-    pinMode(_OE_PIN, OUTPUT);
+    if (_started) return;
 
-    pinMode(_A_PIN, OUTPUT);
-    pinMode(_B_PIN, OUTPUT);
-    pinMode(_C_PIN, OUTPUT);
-    pinMode(_D_PIN, OUTPUT);
-    pinMode(_E_PIN, OUTPUT);
+    if (_width != 64 || _height != 64) {
+      Serial.println(F("PARLIO: only 64x64 panels are supported by this backend."));
+      return;
+    }
+    if (_CLK_PIN == 255 || _R1 == 255 || _G1 == 255 || _B1 == 255 ||
+        _R2 == 255 || _G2 == 255 || _B2 == 255) {
+      Serial.println(F("PARLIO: setRGBPins() must be called before begin()."));
+      return;
+    }
 
-    pinMode(_CLK_PIN, OUTPUT);
-
-    pinMode(_R1, OUTPUT);
-    pinMode(_G1, OUTPUT);
-    pinMode(_B1, OUTPUT);
-    pinMode(_R2, OUTPUT);
-    pinMode(_G2, OUTPUT);
-    pinMode(_B2, OUTPUT);
-
-    digitalWrite(_OE_PIN, HIGH);
-    digitalWrite(_LATCH_PIN, LOW);
-    digitalWrite(_CLK_PIN, LOW);
-
-    freeBuffers();
+    _frameMutex = xSemaphoreCreateMutex();
+    if (!_frameMutex) {
+      Serial.println(F("PARLIO: failed to create frame mutex."));
+      return;
+    }
 
     _buf_size = (uint32_t)PxMATRIX_COLOR_DEPTH * 32UL * 64UL;
     _bufferA = new uint8_t[_buf_size];
     _bufferB = new uint8_t[_buf_size];
-    _frontbuf = _bufferA;
-    _backbuf  = _bufferB;
-
     if (!_bufferA || !_bufferB) {
-      freeBuffers();
+      Serial.println(F("PARLIO: packed framebuffer allocation failed."));
+      freeFrameBuffers();
+      vSemaphoreDelete(_frameMutex);
+      _frameMutex = nullptr;
       return;
     }
 
+    _frontbuf = _bufferA;
+    _backbuf  = _bufferB;
     memset(_frontbuf, 0, _buf_size);
     memset(_backbuf, 0, _buf_size);
 
-    _scan_plane = PxMATRIX_COLOR_DEPTH - 1;
-    _scan_row = 0;
+    // Capture the physical pins assigned to the six fixed PARLIO color slots.
+    _colorSlotPins[0] = _R1;
+    _colorSlotPins[1] = _G1;
+    _colorSlotPins[2] = _B1;
+    _colorSlotPins[3] = _R2;
+    _colorSlotPins[4] = _G2;
+    _colorSlotPins[5] = _B2;
+    if (!rebuildLogicalColorMasks()) {
+      Serial.println(F("PARLIO: invalid initial RGB pin mapping."));
+      return;
+    }
 
-    _R1_MASK = bitMask(_R1);
-    _G1_MASK = bitMask(_G1);
-    _B1_MASK = bitMask(_B1);
-    _R2_MASK = bitMask(_R2);
-    _G2_MASK = bitMask(_G2);
-    _B2_MASK = bitMask(_B2);
-    _CLK_MASK = bitMask(_CLK_PIN);
-    _LAT_MASK = bitMask(_LATCH_PIN);
-    _OE_MASK  = bitMask(_OE_PIN);
-
-    _ADDR_MASK =
-      bitMask(_A_PIN) |
-      bitMask(_B_PIN) |
-      bitMask(_C_PIN) |
-      bitMask(_D_PIN) |
-      bitMask(_E_PIN);
-
-    _RGB_MASK_ALL =
-      _R1_MASK | _G1_MASK | _B1_MASK |
-      _R2_MASK | _G2_MASK | _B2_MASK;
-    _RGB_CLK_MASK = _RGB_MASK_ALL | _CLK_MASK;
-
-    rebuildGpioLUT();
-    rebuildRowAddressLUT();
     rebuildColorPlaneLUT();
-    rebuildPlaneHoldLUT();
+
+    _wave[0] = (uint16_t *)heap_caps_aligned_alloc(
+      32, WAVE_BYTES, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
+    _wave[1] = (uint16_t *)heap_caps_aligned_alloc(
+      32, WAVE_BYTES, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
+
+    if (!_wave[0] || !_wave[1]) {
+      Serial.printf("PARLIO: DMA waveform allocation failed (need %u bytes x2).\n",
+                    (unsigned)WAVE_BYTES);
+      freeWaveBuffers();
+      return;
+    }
+
+    memset(_wave[0], 0, WAVE_BYTES);
+    memset(_wave[1], 0, WAVE_BYTES);
+
+    // Build the initial black frame synchronously before PARLIO starts.
+    buildWaveform(_wave[0], _frontbuf, _brightness);
+    _activeWave = 0;
+    _requestedVersion = 1;
+    _builtVersion = 1;
+    _lastSubmittedWave[0] = 0;
+    _lastSubmittedWave[1] = 0;
+    _txSubmitted = 0;
+    _txCompleted = 0;
+
+    if (!startParlio()) {
+      Serial.println(F("PARLIO: startup failed; panel refresh not started."));
+      return;
+    }
 
     _backDirty = false;
-    _swapPending = false;
     _backNeedsSync = false;
-    _writesSinceService = 0;
-    _serviceCheckCounter = 0;
-    _lastAutoServiceUs = micros();
-    _nextSliceDueUs = micros();
-    _lastSliceStartUs = 0;
-    resetStats();
+    _statSwaps = 0;
+    _statSyncCopies = 0;
+    _statsFrameBase = 0;
+    _started = true;
 
-    fastSetHigh(_OE_MASK);
-    fastSetLow(_LAT_MASK | _CLK_MASK);
-    fastSetLow(_ADDR_MASK);
-    fastSetLow(_RGB_MASK_ALL);
+    Serial.printf("PARLIO HUB75: started, waveform=%u bytes x2, target=%.2f Hz\n",
+                  (unsigned)WAVE_BYTES,
+                  (double)PARLIO_CLK_HZ / (double)FRAME_SAMPLES);
   }
 
-  // Drawing-side clear: clear BACK only, then commit on next public display().
+  // Drawing-side clear: BACK only. display() commits it.
   void clearDisplay() {
     if (!_backbuf) return;
-    // Full overwrite: no need to synchronize old FRONT into BACK first.
     _backNeedsSync = false;
     memset(_backbuf, 0, _buf_size);
-    markBackDirty();
+    _backDirty = true;
   }
 
   void clearDisplay(bool) { clearDisplay(); }
@@ -189,101 +214,76 @@ public:
   void showBuffer() { display(); }
 
   uint16_t color565(uint8_t r, uint8_t g, uint8_t b) {
-    return ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3);
+    return (uint16_t)(((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3));
   }
 
   void setBrightness(uint8_t brightness) {
-    _brightness = brightness;
-    rebuildPlaneHoldLUT();
+    if (!_started || !_frameMutex) {
+      _brightness = brightness;
+      return;
+    }
+    xSemaphoreTake(_frameMutex, portMAX_DELAY);
+    if (_brightness != brightness) {
+      _brightness = brightness;
+      requestWaveUpdateLocked();
+    }
+    xSemaphoreGive(_frameMutex);
   }
 
-  // Public display() is a frame-boundary hint. In paced mode it services
-  // only slices whose deadline has arrived, keeping scan cadence nearly
-  // constant during both idle and rendering periods.
+  // Commit a completed BACK frame. Hardware refresh continues independently.
   void display() {
-    if (!_frontbuf || !_backbuf) return;
-    if (_backDirty) _swapPending = true;
+    if (!_started || !_frontbuf || !_backbuf || !_backDirty) return;
 
-    if (_pacedRefresh) {
-      servicePacedSlice();
-      return;
-    }
+    xSemaphoreTake(_frameMutex, portMAX_DELAY);
 
-    displayRaw(_slices_per_call);
+    uint8_t *tmp = _frontbuf;
+    _frontbuf = _backbuf;
+    _backbuf = tmp;
+
+    _backNeedsSync = true;
+    _backDirty = false;
+    _statSwaps++;
+    requestWaveUpdateLocked();
+
+    xSemaphoreGive(_frameMutex);
   }
 
-  // Explicit-slice API remains available for raw benchmarks.
-  void display(uint16_t slices) {
-    if (_pacedRefresh) {
-      if (_backDirty) _swapPending = true;
-      servicePacedSlice();
-      return;
-    }
-    displayRaw(slices);
-  }
+  void display(uint16_t) { display(); }
 
-  void setPacedRefresh(bool enabled) {
-    _pacedRefresh = enabled;
-    _nextSliceDueUs = micros();
-  }
-  bool getPacedRefresh() const { return _pacedRefresh; }
-
-  void setTargetRefreshHz(uint16_t hz) {
-    if (hz < 80) hz = 80;
-    if (hz > 220) hz = 220;
-    _targetRefreshHz = hz;
-    uint32_t denom = (uint32_t)hz * 96UL;
-    _slicePeriodUs = (1000000UL + denom / 2UL) / denom;
-    if (_slicePeriodUs < 40) _slicePeriodUs = 40;
-    _nextSliceDueUs = micros();
-  }
-  uint16_t getTargetRefreshHz() const { return _targetRefreshHz; }
-  uint32_t getSlicePeriodUs() const { return _slicePeriodUs; }
-
-  // 0 = SAFE3 (3 MMIO writes/column), 1 = DIRECT2 (2 direct writes/column).
-  void setScanMode(uint8_t mode) { _scanMode = mode ? 1 : 0; }
-  uint8_t getScanMode() const { return _scanMode; }
-
-  // Cooperative-refresh tuning. Defaults are deliberately conservative.
-  void setAutoRefresh(bool enabled) { _autoRefresh = enabled; }
-  bool getAutoRefresh() const { return _autoRefresh; }
-
-  void setAutoRefreshPolicy(uint16_t pixelWritesPerBurst,
-                            uint8_t slicesPerBurst,
-                            uint32_t maxGapUs) {
-    if (pixelWritesPerBurst < 16) pixelWritesPerBurst = 16;
-    if (pixelWritesPerBurst > 2048) pixelWritesPerBurst = 2048;
-    if (slicesPerBurst < 1) slicesPerBurst = 1;
-    if (slicesPerBurst > 24) slicesPerBurst = 24;
-    if (maxGapUs < 100) maxGapUs = 100;
-    if (maxGapUs > 5000) maxGapUs = 5000;
-
-    _autoPixelPeriod = pixelWritesPerBurst;
-    _autoSlices = slicesPerBurst;
-    _autoMaxGapUs = maxGapUs;
-  }
-
+  // Compatibility API from V3.2. PARLIO refresh is always hardware paced.
+  void setPacedRefresh(bool enabled) { _pacedRefreshCompat = enabled; }
+  bool getPacedRefresh() const { return _pacedRefreshCompat; }
+  void setTargetRefreshHz(uint16_t) {}
+  uint16_t getTargetRefreshHz() const { return 160; }
+  uint32_t getSlicePeriodUs() const { return 65; }
+  void setScanMode(uint8_t mode) { _scanModeCompat = mode ? 1 : 0; }
+  uint8_t getScanMode() const { return _scanModeCompat; }
+  void setAutoRefresh(bool enabled) { _autoRefreshCompat = enabled; }
+  bool getAutoRefresh() const { return _autoRefreshCompat; }
+  void setAutoRefreshPolicy(uint16_t, uint8_t, uint32_t) {}
   void getAutoRefreshPolicy(uint16_t &pixelWritesPerBurst,
                             uint8_t &slicesPerBurst,
                             uint32_t &maxGapUs) const {
-    pixelWritesPerBurst = _autoPixelPeriod;
-    slicesPerBurst = _autoSlices;
-    maxGapUs = _autoMaxGapUs;
+    pixelWritesPerBurst = 0;
+    slicesPerBurst = 0;
+    maxGapUs = 0;
   }
 
   void resetStats() {
-    _statAutoBursts = 0;
-    _statAutoSlices = 0;
     _statSwaps = 0;
     _statSyncCopies = 0;
-    _maxSliceGapUs = 0;
+    _statsFrameBase = _txCompleted;
   }
 
-  uint32_t getAutoBurstCount() const { return _statAutoBursts; }
-  uint32_t getAutoSliceCount() const { return _statAutoSlices; }
+  uint32_t getAutoBurstCount() const { return _txCompleted - _statsFrameBase; }
+  uint32_t getAutoSliceCount() const { return (_txCompleted - _statsFrameBase) * 96UL; }
   uint32_t getSwapCount() const { return _statSwaps; }
   uint32_t getSyncCopyCount() const { return _statSyncCopies; }
-  uint32_t getMaxSliceGapUs() const { return _maxSliceGapUs; }
+  uint32_t getMaxSliceGapUs() const { return 0; }
+
+  uint32_t getParlioFramesDone() const { return _txCompleted; }
+  int32_t getParlioLastError() const { return _lastTxError; }
+  bool parlioReady() const { return _started && _tx != nullptr; }
 
   void drawPixel(int16_t x, int16_t y, uint16_t color) override {
     if (!_backbuf) return;
@@ -294,13 +294,11 @@ public:
                    (uint16_t)(((color >>  8) & 0x07) << 3) |
                    (uint16_t)(((color >>  2) & 0x07));
     setPixelPlanes(x, y, _colorPlaneLUT[key]);
-    markBackDirty();
-    serviceAfterPixelWrite();
+    _backDirty = true;
   }
 
   void fillScreen(uint16_t color) override {
     if (!_backbuf) return;
-    // Full overwrite: old BACK contents do not need FRONT synchronization.
     _backNeedsSync = false;
 
     uint16_t key = (uint16_t)(((color >> 13) & 0x07) << 6) |
@@ -308,27 +306,20 @@ public:
                    (uint16_t)(((color >>  2) & 0x07));
     uint32_t planes = _colorPlaneLUT[key];
 
-    for (uint8_t plane = 0; plane < 3; plane++) {
+    for (uint8_t plane = 0; plane < 3; ++plane) {
       uint8_t top = (uint8_t)((planes >> (plane * 8)) & 0x07);
       uint8_t both = (uint8_t)(top | (top << 3));
       memset(_backbuf + planeOffset(plane), both, 32UL * 64UL);
     }
-
-    markBackDirty();
-    // fillScreen is only ~tens of microseconds with packed buffers, so no
-    // burst is forced here. The following drawing calls will service scan.
+    _backDirty = true;
   }
 
   void fillRect(int16_t x, int16_t y, int16_t w, int16_t h, uint16_t color) override {
-    if (!_backbuf) return;
-    if (w <= 0 || h <= 0) return;
+    if (!_backbuf || w <= 0 || h <= 0) return;
 
     int16_t x2 = x + w - 1;
     int16_t y2 = y + h - 1;
-
-    if (x >= _width || y >= _height) return;
-    if (x2 < 0 || y2 < 0) return;
-
+    if (x >= _width || y >= _height || x2 < 0 || y2 < 0) return;
     if (x < 0) x = 0;
     if (y < 0) y = 0;
     if (x2 >= _width)  x2 = _width - 1;
@@ -343,92 +334,113 @@ public:
                    (uint16_t)(((color >>  2) & 0x07));
     uint32_t planes = _colorPlaneLUT[key];
 
-    for (int16_t yy = y; yy <= y2; yy++) {
-      for (int16_t xx = x; xx <= x2; xx++) {
+    for (int16_t yy = y; yy <= y2; ++yy) {
+      for (int16_t xx = x; xx <= x2; ++xx) {
         setPixelPlanes(xx, yy, planes);
-        markBackDirty();
-        serviceAfterPixelWrite();
       }
     }
+    _backDirty = true;
   }
 
 private:
+  // PARLIO data-bit layout. P_CLK is generated by the PARLIO clock output.
+  static constexpr uint8_t IDX_B2  = 0;
+  static constexpr uint8_t IDX_B1  = 1;
+  static constexpr uint8_t IDX_OE  = 2;
+  static constexpr uint8_t IDX_G2  = 3;
+  static constexpr uint8_t IDX_G1  = 4;
+  static constexpr uint8_t IDX_LAT = 5;
+  static constexpr uint8_t IDX_R2  = 6;
+  static constexpr uint8_t IDX_R1  = 7;
+  static constexpr uint8_t IDX_A   = 8;
+  static constexpr uint8_t IDX_B   = 9;
+  static constexpr uint8_t IDX_C   = 10;
+  static constexpr uint8_t IDX_D   = 11;
+  static constexpr uint8_t IDX_E   = 12;
+
+  static constexpr uint16_t BIT_OE  = (1U << IDX_OE);
+  static constexpr uint16_t BIT_LAT = (1U << IDX_LAT);
+  static constexpr uint16_t BIT_A   = (1U << IDX_A);
+  static constexpr uint16_t BIT_B   = (1U << IDX_B);
+  static constexpr uint16_t BIT_C   = (1U << IDX_C);
+  static constexpr uint16_t BIT_D   = (1U << IDX_D);
+  static constexpr uint16_t BIT_E   = (1U << IDX_E);
+
+  static constexpr uint32_t PARLIO_CLK_HZ = 4000000UL;
+  static constexpr uint16_t SLOT_CYCLES = 260;
+  static constexpr uint16_t SHIFT_CYCLES = 64;
+  static constexpr uint16_t LATCH_SETTLE_CYCLES = 2;
+  static constexpr uint16_t FRAME_SLICES = 32 * 3;
+  static constexpr uint32_t FRAME_SAMPLES = (uint32_t)FRAME_SLICES * SLOT_CYCLES;
+  static constexpr size_t WAVE_BYTES = FRAME_SAMPLES * sizeof(uint16_t);
+  static constexpr uint8_t TX_QUEUE_DEPTH = 4;
+
+  uint16_t _width = 64;
+  uint16_t _height = 64;
+
+  uint8_t _LATCH_PIN = 255;
+  uint8_t _OE_PIN = 255;
+  uint8_t _A_PIN = 255;
+  uint8_t _B_PIN = 255;
+  uint8_t _C_PIN = 255;
+  uint8_t _D_PIN = 255;
+  uint8_t _E_PIN = 255;
+
+  uint8_t _R1 = 255;
+  uint8_t _G1 = 255;
+  uint8_t _B1 = 255;
+  uint8_t _R2 = 255;
+  uint8_t _G2 = 255;
+  uint8_t _B2 = 255;
+  uint8_t _CLK_PIN = 255;
+
+  // Six fixed physical PARLIO color slots captured at begin().
+  uint8_t _colorSlotPins[6] = {255, 255, 255, 255, 255, 255};
+  uint16_t _bitR1 = (1U << IDX_R1);
+  uint16_t _bitG1 = (1U << IDX_G1);
+  uint16_t _bitB1 = (1U << IDX_B1);
+  uint16_t _bitR2 = (1U << IDX_R2);
+  uint16_t _bitG2 = (1U << IDX_G2);
+  uint16_t _bitB2 = (1U << IDX_B2);
+
   uint8_t *_bufferA = nullptr;
   uint8_t *_bufferB = nullptr;
   uint8_t *_frontbuf = nullptr;
   uint8_t *_backbuf = nullptr;
   uint32_t _buf_size = 0;
 
-  uint32_t _gpioLUT[64] = {0};
-  uint32_t _rowAddressLUT[32] = {0};
   uint32_t _colorPlaneLUT[512] = {0};
-  uint16_t _planeHoldUs[3] = {0, 0, 0};
 
-  uint8_t _scanMode = 1; // V3 defaults to measured-fast DIRECT2.
-  uint32_t _RGB_CLK_MASK = 0;
-
-  bool _backDirty = false;
-  bool _swapPending = false;
+  volatile bool _backDirty = false;
   bool _backNeedsSync = false;
+  uint8_t _brightness = 220;
 
-  bool _autoRefresh = true;
-  bool _pacedRefresh = true;
-  uint16_t _targetRefreshHz = 160;
-  uint32_t _slicePeriodUs = 65;
-  uint32_t _nextSliceDueUs = 0;
-  uint32_t _lastSliceStartUs = 0;
-  uint32_t _maxSliceGapUs = 0;
-  uint16_t _autoPixelPeriod = 128;
-  uint8_t _autoSlices = 2;
-  uint32_t _autoMaxGapUs = 800;
-  uint16_t _writesSinceService = 0;
-  uint8_t _serviceCheckCounter = 0;
-  uint32_t _lastAutoServiceUs = 0;
+  SemaphoreHandle_t _frameMutex = nullptr;
 
-  uint32_t _statAutoBursts = 0;
-  uint32_t _statAutoSlices = 0;
-  uint32_t _statSwaps = 0;
-  uint32_t _statSyncCopies = 0;
+  parlio_tx_unit_handle_t _tx = nullptr;
+  TaskHandle_t _refreshTask = nullptr;
+  uint16_t *_wave[2] = {nullptr, nullptr};
+  uint8_t _activeWave = 0;
 
-  static inline uint32_t bitMask(uint8_t pin) {
-    return (1UL << pin);
-  }
+  volatile uint32_t _txSubmitted = 0;
+  volatile uint32_t _txCompleted = 0;
+  volatile int32_t _lastTxError = ESP_OK;
+  volatile uint32_t _lastSubmittedWave[2] = {0, 0};
 
-  static inline void fastSetHigh(uint32_t mask) {
-    REG_WRITE(GPIO_OUT_W1TS_REG, mask);
-  }
+  volatile uint32_t _requestedVersion = 0;
+  volatile uint32_t _builtVersion = 0;
 
-  static inline void fastSetLow(uint32_t mask) {
-    REG_WRITE(GPIO_OUT_W1TC_REG, mask);
-  }
+  volatile uint32_t _statSwaps = 0;
+  volatile uint32_t _statSyncCopies = 0;
+  volatile uint32_t _statsFrameBase = 0;
+
+  bool _started = false;
+  bool _pacedRefreshCompat = true;
+  bool _autoRefreshCompat = true;
+  uint8_t _scanModeCompat = 1;
 
   static inline uint32_t planeOffset(uint8_t plane) {
     return (uint32_t)plane * 32UL * 64UL;
-  }
-
-  static inline uint32_t scanIndex(uint8_t plane, uint8_t row, uint8_t col) {
-    return planeOffset(plane) + (uint32_t)row * 64UL + col;
-  }
-
-  inline bool atFrameBoundary() const {
-    return (_scan_row == 0 && _scan_plane == (PxMATRIX_COLOR_DEPTH - 1));
-  }
-
-  void freeBuffers() {
-    if (_bufferA) {
-      delete[] _bufferA;
-      _bufferA = nullptr;
-    }
-    if (_bufferB) {
-      delete[] _bufferB;
-      _bufferB = nullptr;
-    }
-    _frontbuf = nullptr;
-    _backbuf = nullptr;
-  }
-
-  inline void markBackDirty() {
-    _backDirty = true;
   }
 
   inline void setPixelPlanes(int16_t x, int16_t y, uint32_t planes) {
@@ -454,101 +466,14 @@ private:
 
   inline void ensureBackSynced() {
     if (!_backNeedsSync || !_frontbuf || !_backbuf) return;
+    // FRONT is immutable between display() commits. Producer only reads it.
     memcpy(_backbuf, _frontbuf, _buf_size);
     _backNeedsSync = false;
     _statSyncCopies++;
   }
 
-  void displayRaw(uint16_t slices) {
-    if (!_frontbuf || !_backbuf) return;
-    if (slices == 0) slices = 1;
-    if (_backDirty) _swapPending = true;
-
-    uint16_t done = 0;
-    uint16_t guard = 0;
-    bool mustCommit = _swapPending;
-    while (done < slices || mustCommit) {
-      maybeSwapAtFrameBoundary();
-      if (!_swapPending) mustCommit = false;
-      refreshSlice();
-      done++;
-      if (++guard > (uint16_t)(slices + 96U)) break;
-    }
-    _lastAutoServiceUs = micros();
-    _writesSinceService = 0;
-  }
-
-  inline bool servicePacedSlice() {
-    uint32_t now = micros();
-    if ((int32_t)(now - _nextSliceDueUs) < 0) return false;
-
-    maybeSwapAtFrameBoundary();
-    refreshSlice();
-    _statAutoBursts++;
-    _statAutoSlices++;
-
-    uint32_t after = micros();
-    int32_t late = (int32_t)(after - _nextSliceDueUs);
-    if (late > (int32_t)(_slicePeriodUs * 2UL)) {
-      // Do not burst-catch-up after a long foreground stall; restart cadence.
-      _nextSliceDueUs = after + _slicePeriodUs;
-    } else {
-      _nextSliceDueUs += _slicePeriodUs;
-    }
-    _lastAutoServiceUs = after;
-    _writesSinceService = 0;
-    return true;
-  }
-
-  inline void serviceAfterPixelWrite() {
-    if (!_autoRefresh || !_frontbuf) return;
-
-    _writesSinceService++;
-    _serviceCheckCounter++;
-
-    if (_pacedRefresh) {
-      // A deadline check every 8 writes is cheap enough and keeps the longest
-      // foreground-only gap well below the visible 5-8 ms threshold.
-      if ((_serviceCheckCounter & 0x07) == 0) {
-        servicePacedSlice();
-      }
-      return;
-    }
-
-    bool dueByPixels = (_writesSinceService >= _autoPixelPeriod);
-    bool dueByTime = false;
-    if ((_serviceCheckCounter & 0x1F) == 0) {
-      uint32_t now = micros();
-      dueByTime = ((uint32_t)(now - _lastAutoServiceUs) >= _autoMaxGapUs);
-    }
-    if (!dueByPixels && !dueByTime) return;
-
-    for (uint8_t i = 0; i < _autoSlices; i++) refreshSlice();
-    _statAutoBursts++;
-    _statAutoSlices += _autoSlices;
-    _writesSinceService = 0;
-    _lastAutoServiceUs = micros();
-  }
-
-  void maybeSwapAtFrameBoundary() {
-    if (!_swapPending || !atFrameBoundary()) return;
-
-    uint8_t *tmp = _frontbuf;
-    _frontbuf = _backbuf;
-    _backbuf = tmp;
-
-    // Defer FRONT->BACK synchronization. Full-frame themes typically call
-    // fillScreen() next, in which case the copy is skipped entirely. Partial
-    // update themes trigger the copy lazily on their first drawPixel/fillRect.
-    _backNeedsSync = true;
-
-    _backDirty = false;
-    _swapPending = false;
-    _statSwaps++;
-  }
-
   void rebuildColorPlaneLUT() {
-    for (uint16_t key = 0; key < 512; key++) {
+    for (uint16_t key = 0; key < 512; ++key) {
       uint8_t r3 = (uint8_t)((key >> 6) & 0x07);
       uint8_t g3 = (uint8_t)((key >> 3) & 0x07);
       uint8_t b3 = (uint8_t)( key       & 0x07);
@@ -559,166 +484,319 @@ private:
     }
   }
 
-  void rebuildGpioLUT() {
-    for (uint8_t v = 0; v < 64; v++) {
-      uint32_t mask = 0;
-      if (v & 0x01) mask |= _R1_MASK;
-      if (v & 0x02) mask |= _G1_MASK;
-      if (v & 0x04) mask |= _B1_MASK;
-      if (v & 0x08) mask |= _R2_MASK;
-      if (v & 0x10) mask |= _G2_MASK;
-      if (v & 0x20) mask |= _B2_MASK;
-      _gpioLUT[v] = mask;
-    }
+  static constexpr uint8_t slotBitIndex(uint8_t slot) {
+    return slot == 0 ? IDX_R1 :
+           slot == 1 ? IDX_G1 :
+           slot == 2 ? IDX_B1 :
+           slot == 3 ? IDX_R2 :
+           slot == 4 ? IDX_G2 : IDX_B2;
   }
 
-  void rebuildRowAddressLUT() {
-    for (uint8_t row = 0; row < 32; row++) {
-      uint32_t mask = 0;
-      if (row & 0x01) mask |= bitMask(_A_PIN);
-      if (row & 0x02) mask |= bitMask(_B_PIN);
-      if (row & 0x04) mask |= bitMask(_C_PIN);
-      if (row & 0x08) mask |= bitMask(_D_PIN);
-      if (row & 0x10) mask |= bitMask(_E_PIN);
-      _rowAddressLUT[row] = mask;
-    }
-  }
-
-  void rebuildPlaneHoldLUT() {
-    static const uint16_t base[3] = {20, 40, 80};
-
-    for (uint8_t plane = 0; plane < 3; plane++) {
-      if (_brightness == 0) {
-        _planeHoldUs[plane] = 0;
-        continue;
+  bool bitForPhysicalPin(uint8_t pin, uint16_t &bit) const {
+    for (uint8_t slot = 0; slot < 6; ++slot) {
+      if (_colorSlotPins[slot] == pin) {
+        bit = (uint16_t)(1U << slotBitIndex(slot));
+        return true;
       }
-
-      uint32_t hold = ((uint32_t)base[plane] * (uint32_t)_brightness) / 255UL;
-      if (hold < 2) hold = 2;
-      if (hold > 200) hold = 200;
-      _planeHoldUs[plane] = (uint16_t)hold;
     }
+    return false;
   }
 
-  inline void setAddressFastRaw(uint8_t row) {
-    fastSetLow(_ADDR_MASK);
-    fastSetHigh(_rowAddressLUT[row]);
-  }
-
-  inline void pulseLatch() {
-    fastSetHigh(_LAT_MASK);
-    fastSetLow(_LAT_MASK);
-  }
-
-  void refreshSlice() {
-    if (!_frontbuf) return;
-    if (_width != 64 || _height != 64) return;
-
-    uint32_t sliceStart = micros();
-    if (_lastSliceStartUs != 0) {
-      uint32_t gap = (uint32_t)(sliceStart - _lastSliceStartUs);
-      if (gap > _maxSliceGapUs) _maxSliceGapUs = gap;
+  bool rebuildLogicalColorMasks() {
+    uint16_t r1, g1, b1, r2, g2, b2;
+    if (!bitForPhysicalPin(_R1, r1) || !bitForPhysicalPin(_G1, g1) ||
+        !bitForPhysicalPin(_B1, b1) || !bitForPhysicalPin(_R2, r2) ||
+        !bitForPhysicalPin(_G2, g2) || !bitForPhysicalPin(_B2, b2)) {
+      return false;
     }
-    _lastSliceStartUs = sliceStart;
+    _bitR1 = r1; _bitG1 = g1; _bitB1 = b1;
+    _bitR2 = r2; _bitG2 = g2; _bitB2 = b2;
+    return true;
+  }
 
-    uint8_t plane = _scan_plane;
-    uint8_t row   = _scan_row;
-    uint16_t hold = _planeHoldUs[plane];
-    const uint8_t *src = _frontbuf + scanIndex(plane, row, 0);
-    const uint32_t *lut = _gpioLUT;
+  inline uint16_t addressBits(uint8_t row) const {
+    uint16_t v = 0;
+    if (row & 0x01) v |= BIT_A;
+    if (row & 0x02) v |= BIT_B;
+    if (row & 0x04) v |= BIT_C;
+    if (row & 0x08) v |= BIT_D;
+    if (row & 0x10) v |= BIT_E;
+    return v;
+  }
 
-    noInterrupts();
+  uint16_t holdCyclesForPlane(uint8_t plane, uint8_t brightness) const {
+    static const uint16_t baseUs[3] = {20, 40, 80};
+    uint32_t us = ((uint32_t)baseUs[plane] * (uint32_t)brightness) / 255UL;
+    if (brightness == 0) us = 0;
+    else if (us < 2) us = 2;
 
-    fastSetHigh(_OE_MASK);
-    fastSetLow(_LAT_MASK);
-    fastSetLow(_RGB_CLK_MASK);
+    uint32_t cycles = (us * PARLIO_CLK_HZ + 999999UL) / 1000000UL;
+    const uint32_t maxHold = SLOT_CYCLES - SHIFT_CYCLES - LATCH_SETTLE_CYCLES - 1;
+    if (cycles > maxHold) cycles = maxHold;
+    return (uint16_t)cycles;
+  }
 
-    if (_scanMode == 0) {
-      #define SHIFT_SAFE_ONE() do { \
-        uint32_t d = lut[*src++]; \
-        fastSetHigh(d); \
-        fastSetHigh(_CLK_MASK); \
-        fastSetLow(_RGB_CLK_MASK); \
-      } while (0)
-      for (uint8_t block = 0; block < 8; block++) {
-        SHIFT_SAFE_ONE(); SHIFT_SAFE_ONE(); SHIFT_SAFE_ONE(); SHIFT_SAFE_ONE();
-        SHIFT_SAFE_ONE(); SHIFT_SAFE_ONE(); SHIFT_SAFE_ONE(); SHIFT_SAFE_ONE();
+  void buildWaveform(uint16_t *dst, const uint8_t *frame, uint8_t brightness) {
+    uint32_t out = 0;
+
+    for (int plane = 2; plane >= 0; --plane) {
+      const uint16_t holdCycles = holdCyclesForPlane((uint8_t)plane, brightness);
+
+      for (uint8_t row = 0; row < 32; ++row) {
+        const uint16_t addr = addressBits(row);
+        const uint32_t slotStart = out;
+        const uint8_t *src = frame + planeOffset((uint8_t)plane) + (uint32_t)row * 64UL;
+
+        for (uint8_t x = 0; x < 64; ++x) {
+          uint8_t p = *src++;
+          uint16_t v = (uint16_t)(addr | BIT_OE);
+
+          if (p & 0x01) v |= _bitR1;
+          if (p & 0x02) v |= _bitG1;
+          if (p & 0x04) v |= _bitB1;
+          if (p & 0x08) v |= _bitR2;
+          if (p & 0x10) v |= _bitG2;
+          if (p & 0x20) v |= _bitB2;
+          if (x == 63) v |= BIT_LAT;
+
+          dst[out++] = v;
+        }
+
+        for (uint16_t i = 0; i < LATCH_SETTLE_CYCLES; ++i) {
+          dst[out++] = (uint16_t)(addr | BIT_OE);
+        }
+
+        for (uint16_t i = 0; i < holdCycles; ++i) {
+          dst[out++] = addr;  // OE=0 -> visible
+        }
+
+        while ((out - slotStart) < SLOT_CYCLES) {
+          dst[out++] = (uint16_t)(addr | BIT_OE);
+        }
       }
-      #undef SHIFT_SAFE_ONE
-    } else {
-      uint32_t base = REG_READ(GPIO_OUT_REG) & ~_RGB_CLK_MASK;
-      #define SHIFT_DIRECT_ONE() do { \
-        uint32_t out = base | lut[*src++]; \
-        REG_WRITE(GPIO_OUT_REG, out); \
-        REG_WRITE(GPIO_OUT_REG, out | _CLK_MASK); \
-      } while (0)
-      for (uint8_t block = 0; block < 8; block++) {
-        SHIFT_DIRECT_ONE(); SHIFT_DIRECT_ONE(); SHIFT_DIRECT_ONE(); SHIFT_DIRECT_ONE();
-        SHIFT_DIRECT_ONE(); SHIFT_DIRECT_ONE(); SHIFT_DIRECT_ONE(); SHIFT_DIRECT_ONE();
-      }
-      #undef SHIFT_DIRECT_ONE
-      REG_WRITE(GPIO_OUT_REG, base);
     }
-
-    pulseLatch();
-    setAddressFastRaw(row);
-
-    fastSetLow(_OE_MASK);
-    if (hold > 0) delayMicroseconds(hold);
-    fastSetHigh(_OE_MASK);
-
-    advanceScan();
-    interrupts();
   }
 
-  void advanceScan() {
-    _scan_row++;
-    if (_scan_row >= 32) {
-      _scan_row = 0;
-      if (_scan_plane == 0) {
-        _scan_plane = PxMATRIX_COLOR_DEPTH - 1;
+  inline void requestWaveUpdateLocked() {
+    ++_requestedVersion;
+    if (_requestedVersion == 0) ++_requestedVersion; // avoid zero after wrap
+  }
+
+  bool tryBuildLatestWave() {
+    uint32_t wanted = _requestedVersion;
+    if (_builtVersion == wanted) return false;
+
+    uint8_t candidate = (uint8_t)(1U - _activeWave);
+
+    // Never touch a buffer that can still be referenced by queued/in-flight DMA.
+    if (_txCompleted < _lastSubmittedWave[candidate]) return false;
+
+    xSemaphoreTake(_frameMutex, portMAX_DELAY);
+
+    // Re-check after obtaining the mutex because display()/brightness/RGB order
+    // may have changed the requested version while we were waiting.
+    wanted = _requestedVersion;
+    if (_builtVersion == wanted) {
+      xSemaphoreGive(_frameMutex);
+      return false;
+    }
+
+    candidate = (uint8_t)(1U - _activeWave);
+    if (_txCompleted < _lastSubmittedWave[candidate]) {
+      xSemaphoreGive(_frameMutex);
+      return false;
+    }
+
+    buildWaveform(_wave[candidate], _frontbuf, _brightness);
+    _activeWave = candidate;
+    _builtVersion = wanted;
+
+    xSemaphoreGive(_frameMutex);
+    return true;
+  }
+
+  static IRAM_ATTR bool txDoneCallback(parlio_tx_unit_handle_t,
+                                       const parlio_tx_done_event_data_t *,
+                                       void *user_data) {
+    PxMATRIX *self = static_cast<PxMATRIX *>(user_data);
+    self->_txCompleted++;
+    return false;
+  }
+
+  static void refreshTaskTrampoline(void *arg) {
+    static_cast<PxMATRIX *>(arg)->refreshTaskLoop();
+  }
+
+  void refreshTaskLoop() {
+    parlio_transmit_config_t txConfig = {};
+    txConfig.idle_value = BIT_OE;  // if queue ever drains, blank panel safely
+    txConfig.flags.queue_nonblocking = false;
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 5, 0)
+    txConfig.flags.loop_transmission = false;
+#endif
+
+    for (;;) {
+      // Build a pending frame while already queued DMA frames continue playing.
+      tryBuildLatestWave();
+
+      uint8_t waveIndex = _activeWave;
+      esp_err_t err = parlio_tx_unit_transmit(
+        _tx,
+        _wave[waveIndex],
+        WAVE_BYTES * 8UL,
+        &txConfig
+      );
+
+      if (err == ESP_OK) {
+        uint32_t seq = ++_txSubmitted;
+        _lastSubmittedWave[waveIndex] = seq;
       } else {
-        _scan_plane--;
+        _lastTxError = err;
+        vTaskDelay(pdMS_TO_TICKS(1));
       }
     }
   }
 
-  uint16_t _width = 64;
-  uint16_t _height = 64;
+  bool startParlio() {
+    parlio_tx_unit_config_t cfg = {};
+    cfg.clk_src = PARLIO_CLK_SRC_DEFAULT;
+    cfg.clk_in_gpio_num = (gpio_num_t)-1;
+    cfg.input_clk_src_freq_hz = 0;
+    cfg.output_clk_freq_hz = PARLIO_CLK_HZ;
+    cfg.data_width = 16;
 
-  uint8_t _LATCH_PIN = 255;
-  uint8_t _OE_PIN    = 255;
-  uint8_t _A_PIN     = 255;
-  uint8_t _B_PIN     = 255;
-  uint8_t _C_PIN     = 255;
-  uint8_t _D_PIN     = 255;
-  uint8_t _E_PIN     = 255;
+    for (size_t i = 0; i < PARLIO_TX_UNIT_MAX_DATA_WIDTH; ++i) {
+      cfg.data_gpio_nums[i] = (gpio_num_t)-1;
+    }
 
-  uint8_t _R1 = 255;
-  uint8_t _G1 = 255;
-  uint8_t _B1 = 255;
-  uint8_t _R2 = 255;
-  uint8_t _G2 = 255;
-  uint8_t _B2 = 255;
-  uint8_t _CLK_PIN = 255;
+    // Fixed PARLIO color slots. Logical RGB order can later be remapped in
+    // software without changing these GPIO routes.
+    cfg.data_gpio_nums[IDX_R1] = (gpio_num_t)_colorSlotPins[0];
+    cfg.data_gpio_nums[IDX_G1] = (gpio_num_t)_colorSlotPins[1];
+    cfg.data_gpio_nums[IDX_B1] = (gpio_num_t)_colorSlotPins[2];
+    cfg.data_gpio_nums[IDX_R2] = (gpio_num_t)_colorSlotPins[3];
+    cfg.data_gpio_nums[IDX_G2] = (gpio_num_t)_colorSlotPins[4];
+    cfg.data_gpio_nums[IDX_B2] = (gpio_num_t)_colorSlotPins[5];
 
-  uint8_t _brightness = 220;
-  uint8_t _slices_per_call = 12;
+    cfg.data_gpio_nums[IDX_OE]  = (gpio_num_t)_OE_PIN;
+    cfg.data_gpio_nums[IDX_LAT] = (gpio_num_t)_LATCH_PIN;
+    cfg.data_gpio_nums[IDX_A]   = (gpio_num_t)_A_PIN;
+    cfg.data_gpio_nums[IDX_B]   = (gpio_num_t)_B_PIN;
+    cfg.data_gpio_nums[IDX_C]   = (gpio_num_t)_C_PIN;
+    cfg.data_gpio_nums[IDX_D]   = (gpio_num_t)_D_PIN;
+    cfg.data_gpio_nums[IDX_E]   = (gpio_num_t)_E_PIN;
 
-  uint8_t _scan_plane = PxMATRIX_COLOR_DEPTH - 1;
-  uint8_t _scan_row = 0;
+    cfg.clk_out_gpio_num = (gpio_num_t)_CLK_PIN;
+    cfg.valid_gpio_num = (gpio_num_t)-1;
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 5, 0)
+    cfg.valid_start_delay = 0;
+    cfg.valid_stop_delay = 0;
+#endif
+    cfg.trans_queue_depth = TX_QUEUE_DEPTH;
+    cfg.max_transfer_size = WAVE_BYTES;
+    cfg.dma_burst_size = 0;
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 5, 0)
+    cfg.shift_edge = PARLIO_SHIFT_EDGE_NEG;
+#else
+    cfg.sample_edge = PARLIO_SAMPLE_EDGE_NEG;
+#endif
+    cfg.bit_pack_order = PARLIO_BIT_PACK_ORDER_MSB;
+    cfg.flags.clk_gate_en = false;
+    cfg.flags.io_loop_back = false;
+    cfg.flags.allow_pd = false;
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 5, 0)
+    cfg.flags.invert_valid_out = false;
+#endif
 
-  uint32_t _R1_MASK = 0;
-  uint32_t _G1_MASK = 0;
-  uint32_t _B1_MASK = 0;
-  uint32_t _R2_MASK = 0;
-  uint32_t _G2_MASK = 0;
-  uint32_t _B2_MASK = 0;
-  uint32_t _CLK_MASK = 0;
-  uint32_t _LAT_MASK = 0;
-  uint32_t _OE_MASK  = 0;
-  uint32_t _ADDR_MASK = 0;
-  uint32_t _RGB_MASK_ALL = 0;
+    esp_err_t err = parlio_new_tx_unit(&cfg, &_tx);
+    if (err != ESP_OK) {
+      _lastTxError = err;
+      Serial.printf("PARLIO: parlio_new_tx_unit failed: %s (%d)\n",
+                    esp_err_to_name(err), (int)err);
+      _tx = nullptr;
+      return false;
+    }
+
+    parlio_tx_event_callbacks_t callbacks = {};
+    callbacks.on_trans_done = txDoneCallback;
+    err = parlio_tx_unit_register_event_callbacks(_tx, &callbacks, this);
+    if (err != ESP_OK) {
+      _lastTxError = err;
+      Serial.printf("PARLIO: callback registration failed: %s (%d)\n",
+                    esp_err_to_name(err), (int)err);
+      return false;
+    }
+
+    err = parlio_tx_unit_enable(_tx);
+    if (err != ESP_OK) {
+      _lastTxError = err;
+      Serial.printf("PARLIO: enable failed: %s (%d)\n",
+                    esp_err_to_name(err), (int)err);
+      return false;
+    }
+
+    BaseType_t ok = xTaskCreate(
+      refreshTaskTrampoline,
+      "hub75_parlio",
+      4096,
+      this,
+      configMAX_PRIORITIES - 1,
+      &_refreshTask
+    );
+    if (ok != pdPASS) {
+      Serial.println(F("PARLIO: failed to create refresh producer task."));
+      _refreshTask = nullptr;
+      return false;
+    }
+
+    return true;
+  }
+
+  void stopParlio() {
+    if (_refreshTask) {
+      vTaskDelete(_refreshTask);
+      _refreshTask = nullptr;
+    }
+
+    if (_tx) {
+      parlio_tx_unit_disable(_tx);
+      parlio_del_tx_unit(_tx);
+      _tx = nullptr;
+    }
+
+    freeWaveBuffers();
+
+    if (_frameMutex) {
+      vSemaphoreDelete(_frameMutex);
+      _frameMutex = nullptr;
+    }
+
+    _started = false;
+  }
+
+  void freeWaveBuffers() {
+    if (_wave[0]) {
+      free(_wave[0]);
+      _wave[0] = nullptr;
+    }
+    if (_wave[1]) {
+      free(_wave[1]);
+      _wave[1] = nullptr;
+    }
+  }
+
+  void freeFrameBuffers() {
+    if (_bufferA) {
+      delete[] _bufferA;
+      _bufferA = nullptr;
+    }
+    if (_bufferB) {
+      delete[] _bufferB;
+      _bufferB = nullptr;
+    }
+    _frontbuf = nullptr;
+    _backbuf = nullptr;
+  }
 };
 
 #endif
